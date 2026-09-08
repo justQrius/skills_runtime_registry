@@ -5,6 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import base64
+import io
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -45,6 +48,12 @@ class ManifestTest(unittest.TestCase):
                 self.assertEqual(validate(m), [])
                 self.assertEqual(digest(m), m["integrity"]["sha256"])
 
+    def test_valid_fixture_integrity_survives_normalization(self):
+        for f in ("valid-instruction.json", "valid-tool.json"):
+            with self.subTest(f):
+                m = normalize(fixture(f))
+                self.assertEqual(digest(m), m["integrity"]["sha256"])
+
     def test_invalid_fixtures(self):
         cases = {"invalid-bad-id.json": "bad skill_id",
                  "invalid-bad-version.json": "bad version",
@@ -75,6 +84,52 @@ class ManifestTest(unittest.TestCase):
         self.assertNotIn("execution_mode", normalize(raw))
         self.assertEqual(validate(m), [])
 
+    def test_wrong_types_are_rejected_before_search_can_crash(self):
+        m = normalize(fixture("valid-instruction.json"))
+        m["popularity"] = "lots"
+        m["topics"] = "react"
+        errs = validate(m)
+        self.assertIn("popularity must be a non-negative integer", errs)
+        self.assertIn("topics must be an array of strings", errs)
+
+    def test_mode_specific_artifacts_are_required(self):
+        tool = normalize(fixture("valid-tool.json"))
+        tool["artifact"]["tool_ref"] = None
+        self.assertIn("tool mode requires artifact.tool_ref", validate(tool))
+
+        executable = normalize({
+            "skill_id": "acme/runner", "version": "1.0.0", "name": "Runner",
+            "description": "Runs things.", "publisher": {"id": "acme"},
+            "execution_modes": ["executable"], "artifact": {"files": []},
+        })
+        self.assertIn("executable mode requires artifact.entrypoints", validate(executable))
+
+        workflow = normalize({
+            "skill_id": "acme/workflow", "version": "1.0.0", "name": "Workflow",
+            "description": "Runs a workflow.", "publisher": {"id": "acme"},
+            "execution_modes": ["workflow"],
+        })
+        self.assertIn("workflow mode requires artifact.workflow", validate(workflow))
+
+    def test_unsafe_and_duplicate_package_paths_are_rejected(self):
+        m = normalize(fixture("valid-instruction.json"))
+        m["artifact"]["files"] = [
+            {"path": "../escape.py", "sha256": None, "size": 1},
+            {"path": "../escape.py", "sha256": None, "size": 1},
+        ]
+        errs = validate(m)
+        self.assertTrue(any("unsafe artifact file path" in e for e in errs), errs)
+        self.assertTrue(any("duplicate artifact file path" in e for e in errs), errs)
+
+    def test_normalize_migrates_legacy_multisegment_publisher_and_pack(self):
+        raw = dict(fixture("valid-instruction.json"))
+        raw["skill_id"] = "vercel-labs/agent-skills/react-best-practices"
+        raw["publisher"] = {"id": "vercel-labs/agent-skills"}
+        raw["pack"] = None
+        m = normalize(raw)
+        self.assertEqual(m["publisher"]["id"], "vercel-labs")
+        self.assertEqual(m["pack"], "vercel-labs/agent-skills")
+
 
 class SearchTest(unittest.TestCase):
     def test_keyword(self):
@@ -89,6 +144,25 @@ class SearchTest(unittest.TestCase):
         items = seed_registry().all()
         got = search(items, "", official_only=True, audited_only=True)
         self.assertEqual([m["skill_id"] for m in got], ["official/procurement-flow"])
+
+    def test_search_stems_terms_and_indexes_instruction_and_file_paths(self):
+        item = normalize({
+            "skill_id": "acme/pdf-kit", "version": "1.0.0", "name": "PDF kit",
+            "description": "Utilities for rotating documents.",
+            "publisher": {"id": "acme"}, "execution_modes": ["instruction"],
+            "artifact": {
+                "instruction": "Add a watermark to confidential files.",
+                "files": [{"path": "scripts/rotate_pages.py", "sha256": None, "size": 0}],
+            },
+        })
+        for query in ("rotate", "rotation", "watermark", "rotate pages"):
+            with self.subTest(query=query):
+                self.assertEqual([m["skill_id"] for m in search([item], query)],
+                                 ["acme/pdf-kit"])
+
+    def test_search_requires_all_meaningful_query_terms(self):
+        items = seed_registry().all()
+        self.assertEqual(search(items, "discover submarine"), [])
 
 
 class PolicyTest(unittest.TestCase):
@@ -121,6 +195,28 @@ class PolicyTest(unittest.TestCase):
         kept = resolve(items, policy={"require_audited": True}, require_review=True)
         self.assertEqual(kept["candidates"][0]["rationale"], ["policy:require-review"])
 
+    def test_resolve_does_not_rank_irrelevant_skills_on_trust_alone(self):
+        result = resolve(seed_registry().all(), task="repair submarine sonar")
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["fallback"], "fall back to native reasoning")
+
+    def test_resolve_reports_relevant_gated_candidates(self):
+        item = normalize({
+            "skill_id": "acme/pdf-runner", "version": "1.0.0", "name": "PDF runner",
+            "description": "Rotate PDF documents.", "publisher": {"id": "acme"},
+            "execution_modes": ["executable"],
+            "artifact": {"files": [{"path": "run.py", "sha256": None, "size": 0}],
+                         "entrypoints": ["run.py"]},
+        })
+        result = resolve([item], task="rotate a PDF")
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["fallback"], "matching skills require review")
+        self.assertEqual(result["review_candidates"][0]["skill_id"], "acme/pdf-runner")
+
+    def test_resolve_rejects_non_positive_limits(self):
+        with self.assertRaisesRegex(ValueError, "limit"):
+            resolve(seed_registry().all(), task="react", limit=-1)
+
 
 class CacheTest(unittest.TestCase):
     def test_verify_roundtrip_and_pin(self):
@@ -138,6 +234,17 @@ class CacheTest(unittest.TestCase):
         c.put(m)
         m["trust"]["audited"] = False
         self.assertIsNone(c.get("x/y"))
+
+    def test_cache_keeps_multiple_versions(self):
+        c = Cache()
+        for version in ("1.9.0", "1.10.0"):
+            m = normalize(fixture("valid-instruction.json"))
+            m["version"] = version
+            m["integrity"]["sha256"] = None
+            c.put(m)
+        self.assertEqual(c.get_version("acme/react-review", "1.9.0")["version"],
+                         "1.9.0")
+        self.assertEqual(c.get("acme/react-review")["version"], "1.10.0")
 
 
 class LoaderTest(unittest.TestCase):
@@ -157,6 +264,33 @@ class LoaderTest(unittest.TestCase):
         self.assertIn(out["tool"], sess["tools"])
         unload(m, sess)
         self.assertEqual(sess["tools"], {})
+
+    def test_hybrid_load_exposes_all_modes_and_entrypoints(self):
+        m = normalize({
+            "skill_id": "acme/hybrid", "version": "1.0.0", "name": "Hybrid",
+            "description": "Instructions and a runner.", "publisher": {"id": "acme"},
+            "execution_modes": ["instruction", "executable"],
+            "artifact": {"instruction": "Use this.",
+                         "files": [{"path": "run.py", "sha256": None, "size": 0}],
+                         "entrypoints": ["run.py"]},
+        })
+        out = load(m)
+        self.assertEqual(out["kind"], "instruction")
+        self.assertEqual(out["execution_modes"], ["instruction", "executable"])
+        self.assertEqual(out["entrypoints"], ["run.py"])
+        self.assertTrue(out["requires_approval"])
+
+    def test_workflow_load_returns_portable_definition(self):
+        definition = {"steps": [{"id": "review", "skill_id": "acme/react-review"}]}
+        m = normalize({
+            "skill_id": "acme/workflow", "version": "1.0.0", "name": "Workflow",
+            "description": "Runs a workflow.", "publisher": {"id": "acme"},
+            "execution_modes": ["workflow"], "artifact": {"workflow": definition},
+        })
+        out = load(m)
+        self.assertEqual(out["kind"], "workflow")
+        self.assertEqual(out["workflow"], definition)
+        self.assertFalse(out["deferred"])
 
 
 class TelemetryTest(unittest.TestCase):
@@ -188,12 +322,43 @@ class IngestTest(unittest.TestCase):
         self.assertEqual([f["path"] for f in m["artifact"]["files"]],
                          ["SKILL.md", "run.sh"])
         self.assertTrue(all(len(f["sha256"]) == 64 for f in m["artifact"]["files"]))
+        self.assertEqual(m["artifact"]["source_hash"], "abc")
+        self.assertTrue(Cache().verify(m))
+
+    def test_mapping_uses_owner_as_publisher_repo_as_pack_and_supported_entrypoints(self):
+        d = {"id": "vercel-labs/agent-skills/x", "slug": "x", "hash": "a" * 64,
+             "version": "2.3.4", "topics": ["react"],
+             "files": [{"path": "SKILL.md", "contents": "# X\n\nGuide."},
+                       {"path": "run.js", "contents": "console.log(1)"},
+                       {"path": "build.ts", "contents": "console.log(2)"}]}
+        m = normalize(to_manifest(d, None))
+        self.assertEqual(m["publisher"]["id"], "vercel-labs")
+        self.assertEqual(m["pack"], "vercel-labs/agent-skills")
+        self.assertEqual(m["topics"], ["react"])
+        self.assertEqual(m["version"], "2.3.4")
+        self.assertEqual(m["artifact"]["entrypoints"], ["run.js"])
+        self.assertIn("executable", m["execution_modes"])
+
+    def test_mapping_does_not_advertise_unsupported_runtimes(self):
+        d = {"id": "acme/ts-only", "slug": "ts-only", "hash": "b" * 64,
+             "files": [{"path": "SKILL.md", "contents": "# T\n\nGuide."},
+                       {"path": "run.ts", "contents": "console.log(1)"}]}
+        m = normalize(to_manifest(d, None))
+        self.assertEqual(m["execution_modes"], ["instruction"])
+        self.assertEqual(m["artifact"]["entrypoints"], [])
 
     def test_frontmatter_stripped(self):
         d = {"id": "a/b", "slug": "b", "installs": 1, "hash": "h",
              "files": [{"path": "SKILL.md",
                         "contents": "---\nname: x\n---\n\n# T\n\nReal desc."}]}
         self.assertEqual(to_manifest(d, None)["description"], "Real desc.")
+
+    def test_frontmatter_description_is_indexed(self):
+        d = {"id": "a/b", "slug": "b", "installs": 1, "hash": "h",
+             "files": [{"path": "SKILL.md",
+                        "contents": "---\nname: x\ndescription: Rotate and watermark PDFs.\n---\n\n# T\n\nBody."}]}
+        self.assertEqual(to_manifest(d, None)["description"],
+                         "Rotate and watermark PDFs.")
 
     def test_store_artifact(self):
         reg = seed_registry()
@@ -214,8 +379,59 @@ class FilesTest(unittest.TestCase):
 
     def test_oversize_rejected(self):
         fs = FileStore()
+        self.assertEqual(fs.put("a/b", "medium.bin", b"x" * 1_000_001)["size"],
+                         1_000_001)
         with self.assertRaises(ValueError):
-            fs.put("a/b", "big.bin", b"x" * (1_000_001))
+            fs.put("a/b", "big.bin", b"x" * (10_000_001))
+
+    def test_binary_files_roundtrip_exactly_over_mcp_shape(self):
+        fs = FileStore()
+        raw = bytes(range(256))
+        meta = fs.put("a/b", "asset.bin", raw, version="1.0.0")
+        doc = fs.get("a/b", "asset.bin", meta["sha256"], version="1.0.0")
+        self.assertIsNone(doc["contents"])
+        self.assertEqual(base64.b64decode(doc["contents_b64"]), raw)
+
+    def test_versions_do_not_overwrite_each_others_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            fs = FileStore(d)
+            one = fs.put("a/b", "SKILL.md", "one", version="1.0.0")
+            two = fs.put("a/b", "SKILL.md", "two", version="2.0.0")
+            reopened = FileStore(d)
+            self.assertEqual(reopened.get("a/b", "SKILL.md", one["sha256"],
+                                          version="1.0.0")["contents"], "one")
+            self.assertEqual(reopened.get("a/b", "SKILL.md", two["sha256"],
+                                          version="2.0.0")["contents"], "two")
+
+    def test_bundle_write_is_atomic_when_any_file_is_too_large(self):
+        fs = FileStore()
+        with self.assertRaisesRegex(ValueError, "file too large"):
+            fs.put_bundle("a/b", "1.0.0", [
+                ("small.txt", b"small"),
+                ("large.bin", b"x" * 10_000_001),
+            ])
+        self.assertIsNone(fs.get("a/b", "small.txt", version="1.0.0"))
+
+
+class StoreVersionTest(unittest.TestCase):
+    def test_latest_uses_semver_not_lexical_order(self):
+        reg = Registry()
+        for version in ("1.9.0", "1.10.0"):
+            raw = dict(fixture("valid-instruction.json"))
+            raw["version"] = version
+            reg.add(raw)
+        self.assertEqual(reg.get("acme/react-review")["version"], "1.10.0")
+
+
+class JsParityTest(unittest.TestCase):
+    def test_js_sdk_conformance(self):
+        import shutil
+        if shutil.which("node") is None:
+            self.skipTest("node unavailable")
+        run = subprocess.run(["node", "js/test.mjs"], cwd=ROOT,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("js sdk conformance ok", run.stdout)
 
 
 class McpTest(unittest.TestCase):
@@ -229,15 +445,21 @@ class McpTest(unittest.TestCase):
         names = [t["name"] for t in
                  srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
                  ["result"]["tools"]]
-        self.assertEqual(names, ["search", "resolve", "load", "get_artifact",
-                                 "get_file", "refresh", "execute"])
+        self.assertEqual(names, ["search", "resolve", "list_versions", "validate_skill",
+                                 "load", "get_artifact",
+                                 "get_file", "get_files", "get_package",
+                                 "invoke_tool", "refresh", "execute"])
 
         def text(resp):
             return json.loads(resp["result"]["content"][0]["text"])
 
         r = srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                         "params": {"name": "search", "arguments": {"query": "react"}}})
-        self.assertEqual([m["skill_id"] for m in text(r)], ["acme/react-review"])
+        cards = text(r)
+        self.assertEqual([m["skill_id"] for m in cards], ["acme/react-review"])
+        for field in ("name", "publisher", "topics", "tags", "pack", "permissions",
+                      "compatibility", "integrity", "entrypoints"):
+            self.assertIn(field, cards[0])
 
         r = srv.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                         "params": {"name": "resolve",
@@ -262,6 +484,124 @@ class McpTest(unittest.TestCase):
                                    "arguments": {"skill_id": "acme/react-review",
                                                  "path": "SKILL.md"}}})
         self.assertEqual(r["error"]["code"], -32002)
+
+    def test_search_limit_is_declared_and_validated(self):
+        from skill_registry import server as mcp_server
+
+        srv = mcp_server.Server(ROOT / "catalog", tempfile.mkdtemp())
+        search_schema = srv.TOOLS["search"][1]
+        self.assertIn("limit", search_schema["properties"])
+        with self.assertRaisesRegex(ValueError, "limit"):
+            srv.t_search({"limit": -1})
+
+    def test_list_versions_is_semver_ordered(self):
+        from skill_registry import server as mcp_server
+
+        srv = mcp_server.Server(ROOT / "catalog", tempfile.mkdtemp())
+        for version in ("1.9.0", "1.10.0"):
+            raw = dict(fixture("valid-instruction.json"))
+            raw["version"] = version
+            srv.reg.add(raw)
+        result = srv.t_list_versions({"skill_id": "acme/react-review"})
+        self.assertEqual(result["versions"][:2], ["1.10.0", "1.9.0"])
+
+    def test_validate_skill_supports_ecosystem_and_strict_profiles(self):
+        import hashlib
+        from skill_registry import server as mcp_server
+
+        body = (b"---\nname: sample\ndescription: Sample skill.\n---\n\n# Sample\n\n"
+                b"See `references/guide.md`.\n")
+        reference = b"# Guide\n"
+        with tempfile.TemporaryDirectory() as d:
+            srv = mcp_server.Server(ROOT / "catalog", d)
+            raw = normalize({
+                "skill_id": "test/sample", "version": "1.0.0", "name": "Sample",
+                "description": "Sample skill.", "publisher": {"id": "test"},
+                "execution_modes": ["instruction"], "artifact": {"instruction": body.decode(),
+                    "files": [
+                        {"path": "SKILL.md", "sha256": hashlib.sha256(body).hexdigest(), "size": len(body)},
+                        {"path": "references/guide.md", "sha256": hashlib.sha256(reference).hexdigest(), "size": len(reference)},
+                    ]},
+            })
+            srv.reg.add(raw)
+            srv.files.put_bundle(raw["skill_id"], raw["version"],
+                                 [("SKILL.md", body), ("references/guide.md", reference)])
+            ecosystem = srv.t_validate_skill({"skill_id": raw["skill_id"]})
+            self.assertTrue(ecosystem["valid"])
+            strict = srv.t_validate_skill({"skill_id": raw["skill_id"], "profile": "strict"})
+            self.assertFalse(strict["valid"])
+            self.assertIn("missing section: Contract", strict["issues"])
+
+    def test_bulk_files_and_deterministic_package_archive(self):
+        from skill_registry import server as mcp_server
+
+        with tempfile.TemporaryDirectory() as d:
+            srv = mcp_server.Server(ROOT / "catalog", d)
+            raw = dict(fixture("valid-instruction.json"))
+            body = b"---\nname: x\ndescription: y\n---\n\n# X\n"
+            import hashlib
+            raw["artifact"] = {"instruction": body.decode(), "tool_ref": None,
+                               "files": [{"path": "SKILL.md",
+                                          "sha256": hashlib.sha256(body).hexdigest(),
+                                          "size": len(body)}]}
+            raw["integrity"] = {"sha256": None}
+            srv.reg.add(raw)
+            srv.files.put(raw["skill_id"], "SKILL.md", body, version=raw["version"])
+
+            files = srv.t_get_files({"skill_id": raw["skill_id"]})
+            self.assertEqual([f["path"] for f in files["files"]], ["SKILL.md"])
+            package1 = srv.t_get_package({"skill_id": raw["skill_id"]})
+            package2 = srv.t_get_package({"skill_id": raw["skill_id"]})
+            self.assertEqual(package1["sha256"], package2["sha256"])
+            self.assertEqual(package1["files"], raw["artifact"]["files"])
+            with zipfile.ZipFile(io.BytesIO(base64.b64decode(package1["contents_b64"]))) as z:
+                self.assertEqual(z.read("SKILL.md"), body)
+
+    def test_execute_distinguishes_unknown_version_from_unknown_skill(self):
+        from skill_registry import server as mcp_server
+
+        srv = mcp_server.Server(ROOT / "catalog", tempfile.mkdtemp())
+        with self.assertRaisesRegex(KeyError, "unknown version"):
+            srv.t_execute({"skill_id": "acme/react-review", "version": "9.9.9",
+                           "entrypoint": "run.py"})
+
+    def test_tool_invocation_proxy_reports_and_uses_registered_handler(self):
+        from skill_registry import server as mcp_server
+
+        unavailable = mcp_server.Server(ROOT / "catalog", tempfile.mkdtemp())
+        loaded = unavailable.t_load({"skill_id": "official/procurement-flow"})
+        self.assertFalse(loaded["available"])
+        self.assertEqual(unavailable.t_invoke_tool({
+            "skill_id": "official/procurement-flow", "input": {"id": 7},
+        })["status"], "unavailable")
+
+        available = mcp_server.Server(
+            ROOT / "catalog", tempfile.mkdtemp(),
+            tool_handlers={"procurement.approve": lambda value: {"approved": value["id"]}},
+        )
+        self.assertTrue(available.t_load({"skill_id": "official/procurement-flow"})["available"])
+        self.assertEqual(available.t_invoke_tool({
+            "skill_id": "official/procurement-flow", "input": {"id": 7},
+        })["output"], {"approved": 7})
+
+    def test_tool_invocation_validates_input_and_output_schemas(self):
+        from skill_registry import server as mcp_server
+
+        srv = mcp_server.Server(ROOT / "catalog", tempfile.mkdtemp(),
+                                tool_handlers={"math.double": lambda value: {"result": "bad"}})
+        srv.reg.add({
+            "skill_id": "test/double", "version": "1.0.0", "name": "Double",
+            "description": "Double a number.", "publisher": {"id": "test"},
+            "execution_modes": ["tool"], "artifact": {"tool_ref": "math.double"},
+            "input_schema": {"type": "object", "required": ["value"],
+                             "properties": {"value": {"type": "number"}}},
+            "output_schema": {"type": "object", "required": ["result"],
+                              "properties": {"result": {"type": "number"}}},
+        })
+        with self.assertRaisesRegex(ValueError, "input.value"):
+            srv.t_invoke_tool({"skill_id": "test/double", "input": {"value": "bad"}})
+        with self.assertRaisesRegex(ValueError, "output.result"):
+            srv.t_invoke_tool({"skill_id": "test/double", "input": {"value": 2}})
 
     def test_refresh_unconfigured(self):
         from skill_registry import server as mcp_server
@@ -337,6 +677,19 @@ class HardenTest(unittest.TestCase):
             srv2 = mcp_server.Server(ROOT / "catalog", d)
             self.assertIsNotNone(srv2.reg.get("acme/react-review"))
 
+    def test_manifest_persistence_keeps_multiple_versions(self):
+        from skill_registry import server as mcp_server
+
+        with tempfile.TemporaryDirectory() as d:
+            srv = mcp_server.Server(ROOT / "catalog", d)
+            for version in ("1.0.0", "2.0.0"):
+                m = dict(fixture("valid-instruction.json"))
+                m["version"] = version
+                srv._save_manifest(m)
+            srv2 = mcp_server.Server(ROOT / "catalog", d)
+            self.assertIsNotNone(srv2.reg.get("acme/react-review", "1.0.0"))
+            self.assertIsNotNone(srv2.reg.get("acme/react-review", "2.0.0"))
+
     def test_server_telemetry(self):
         from skill_registry import server as mcp_server
 
@@ -409,13 +762,23 @@ class ExecuteTest(unittest.TestCase):
                 "integrity": {"sha256": "0" * 64},
                 "artifact": {"files": [
                     {"path": "hello.py", "sha256": "", "size": 0},
-                    {"path": "SKILL.md", "sha256": "", "size": 0}]},
+                    {"path": "SKILL.md", "sha256": "", "size": 0}],
+                    "entrypoints": ["hello.py"]},
                 "popularity": 0}
 
     def test_gate_needs_approval(self):
         from skill_registry.execute import gate
         self.assertEqual(gate(self.manifest(), None, False)["status"], "needs-approval")
         self.assertEqual(gate(self.manifest(), None, True)["status"], "ok")
+
+    def test_docker_text_output_is_decoded_independently_of_host_locale(self):
+        from unittest import mock
+        from skill_registry.execute import _run_text
+
+        with mock.patch("skill_registry.execute.subprocess.run") as run:
+            _run_text(["docker", "version"], timeout=3)
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
 
     def test_inputs_validated(self):
         from skill_registry.execute import parse_inputs
@@ -427,19 +790,57 @@ class ExecuteTest(unittest.TestCase):
                          [("b.bin", b"hi")])
         for bad in ({"path": "../evil.txt", "text": "x"},
                     {"path": "/abs.txt", "text": "x"},
+                    {"path": "nested\\windows.txt", "text": "x"},
                     {"path": "a.txt"},
                     {"path": "a.txt", "text": "x", "b64": "eA=="},
                     {"path": "a.txt", "b64": "!!!"}):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     parse_inputs([bad])
+        with self.assertRaisesRegex(ValueError, "duplicate input path"):
+            parse_inputs([{"path": "same.txt", "text": "one"},
+                          {"path": "same.txt", "text": "two"}])
         with self.assertRaises(ValueError):
-            parse_inputs([{"path": "big.bin", "b64": "eA=="}] * 51)
+            parse_inputs([{"path": f"file-{i}.bin", "b64": "eA=="}
+                          for i in range(101)])
 
     def test_inputs_oversize_rejected(self):
         from skill_registry.execute import parse_inputs
+        self.assertEqual(len(parse_inputs([
+            {"path": "medium.bin", "text": "x" * 1_000_001}
+        ])[0][1]), 1_000_001)
         with self.assertRaises(ValueError):
-            parse_inputs([{"path": "big.bin", "text": "x" * 1_000_001}])
+            parse_inputs([{"path": "big.bin", "text": "x" * 10_000_001}])
+
+    def test_dependency_plan_rejects_requirement_injection(self):
+        from skill_registry.execute import dependency_plan
+        with tempfile.TemporaryDirectory() as d:
+            req = Path(d) / "requirements.txt"
+            req.write_text("--index-url https://evil.invalid/simple\npackage==1.0.0\n")
+            with self.assertRaisesRegex(ValueError, "unsafe requirements directive"):
+                dependency_plan(Path(d))
+
+    def test_dependency_plan_reports_reproducibility(self):
+        from skill_registry.execute import dependency_plan
+        with tempfile.TemporaryDirectory() as d:
+            req = Path(d) / "requirements.txt"
+            req.write_text("package>=1.0\n")
+            self.assertFalse(dependency_plan(Path(d))["reproducible"])
+            req.write_text("package==1.2.3\n")
+            plan = dependency_plan(Path(d))
+            self.assertTrue(plan["reproducible"])
+            self.assertTrue(plan["network_required"])
+
+    def test_execution_request_limits_validate_before_docker(self):
+        from skill_registry.execute import execute
+        m = self.manifest()
+        blobs = {"hello.py": b"print('hi')", "SKILL.md": b"# T"}
+        with self.assertRaisesRegex(ValueError, "timeout_s"):
+            execute(m, lambda p, s: blobs.get(p), "hello.py", approved=True,
+                    timeout_s=0)
+        with self.assertRaisesRegex(ValueError, "args"):
+            execute(m, lambda p, s: blobs.get(p), "hello.py", args=[7],
+                    approved=True)
 
     def test_artifacts_include_b64(self):
         from skill_registry.execute import collect_artifacts
@@ -453,6 +854,27 @@ class ExecuteTest(unittest.TestCase):
             self.assertEqual(base64.b64decode(arts["out.pdf"]["contents_b64"]),
                              bytes(range(256)))
             self.assertIsNone(arts["out.pdf"]["contents"])
+            self.assertTrue(all("\\" not in a["path"] for a in arts.values()))
+
+    def test_nested_artifact_paths_are_posix(self):
+        from skill_registry.execute import collect_artifacts
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "nested" / "out.txt"
+            path.parent.mkdir()
+            path.write_text("hello")
+            self.assertEqual(collect_artifacts(Path(d))[0]["path"],
+                             "nested/out.txt")
+
+    def test_artifact_receipt_discloses_truncation(self):
+        from skill_registry.execute import collect_artifacts_with_receipt
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(201):
+                (Path(d) / f"{i:03}.txt").write_text(str(i))
+            artifacts, receipt = collect_artifacts_with_receipt(Path(d))
+            self.assertEqual(len(artifacts), 200)
+            self.assertEqual(receipt["discovered"], 201)
+            self.assertTrue(receipt["truncated"])
+            self.assertIn("artifact-count", receipt["reasons"])
 
     def test_unknown_entrypoint(self):
         from skill_registry.execute import execute
@@ -460,6 +882,15 @@ class ExecuteTest(unittest.TestCase):
         blobs = {"hello.py": b"print('hi')", "SKILL.md": b"# T"}
         with self.assertRaises(ValueError):
             execute(m, lambda p, s: blobs.get(p), "missing.py", approved=True)
+
+    def test_supported_but_undeclared_entrypoint_is_rejected(self):
+        from skill_registry.execute import execute
+        m = self.manifest()
+        m["artifact"]["files"].append({"path": "helper.py", "sha256": "", "size": 0})
+        blobs = {"hello.py": b"print('hi')", "helper.py": b"print('wrong')",
+                 "SKILL.md": b"# T"}
+        with self.assertRaisesRegex(ValueError, "declared entrypoint"):
+            execute(m, lambda p, s: blobs.get(p), "helper.py", approved=True)
 
     def test_unsupported_entrypoint(self):
         from skill_registry.execute import execute
@@ -533,7 +964,9 @@ class ExecuteTest(unittest.TestCase):
             raw = {"skill_id": "t/gated", "version": "1.0.0", "name": "G",
                    "description": "gated exec skill",
                    "publisher": {"id": "t"}, "execution_modes": ["executable"],
-                   "artifact": {"instruction": "Run me.", "files": []}}
+                   "artifact": {"instruction": "Run me.",
+                                "files": [{"path": "run.py", "sha256": None, "size": 0}],
+                                "entrypoints": ["run.py"]}}
             srv.reg.add(raw)
             r = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                             "params": {"name": "execute",
@@ -544,6 +977,42 @@ class ExecuteTest(unittest.TestCase):
             self.assertEqual(body["verdict"], "sandbox-only")
             names = [e["event"] for e in srv.tel.events]
             self.assertNotIn("execution.ok", names)
+
+    def test_failed_execution_preserves_streams_sets_mcp_error_and_emits_telemetry(self):
+        import hashlib
+        import shutil
+        from skill_registry import server as mcp_server
+
+        if shutil.which("docker") is None:
+            self.skipTest("no docker")
+        body = b"import sys\nprint('hello')\nprint('boom', file=sys.stderr)\nsys.exit(7)\n"
+        with tempfile.TemporaryDirectory() as d:
+            srv = mcp_server.Server(ROOT / "catalog", d)
+            raw = normalize({
+                "skill_id": "test/failure", "version": "1.0.0", "name": "Failure",
+                "description": "Fails for testing.", "publisher": {"id": "test"},
+                "execution_modes": ["executable"],
+                "artifact": {"files": [{"path": "fail.py",
+                                          "sha256": hashlib.sha256(body).hexdigest(),
+                                          "size": len(body)}],
+                             "entrypoints": ["fail.py"]},
+            })
+            srv.reg.add(raw)
+            srv.files.put(raw["skill_id"], "fail.py", body, version=raw["version"])
+            response = srv.handle({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "execute", "arguments": {
+                    "skill_id": raw["skill_id"], "entrypoint": "fail.py",
+                    "approved": True,
+                }},
+            })
+            self.assertTrue(response["result"]["isError"])
+            result = json.loads(response["result"]["content"][0]["text"])
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["exit_code"], 7)
+            self.assertIn("hello", result["stdout"])
+            self.assertIn("boom", result["stderr"])
+            self.assertIn("execution.fail", [e["event"] for e in srv.tel.events])
 
 
 if __name__ == "__main__":

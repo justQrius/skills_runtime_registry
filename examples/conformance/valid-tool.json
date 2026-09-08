@@ -44,7 +44,7 @@
     "revoked": false
   },
   "integrity": {
-    "sha256": "61fa7db4fb9cb1be726eeaf4ec7409caed705b6234e3ad9553646414cbf2807a"
+    "sha256": "c19ae7038eec1841542e3859c250ff607bb29e0841d5c64eec62a278d258fdbc"
   },
   "cache": {
     "ttl_seconds": 7200,
@@ -54,7 +54,9 @@
   "artifact": {
     "tool_ref": "procurement.approve",
     "instruction": null,
-    "files": []
+    "workflow": null,
+    "files": [],
+    "entrypoints": []
   },
   "pack": null,
   "tool_dependencies": [],

@@ -4,13 +4,13 @@ Strict subset of `schema/manifest.schema.json`. Unknown top-level keys rejected 
 
 | `skill_id` | `publisher/name` | `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+$` (multi-segment for skills.sh `source/slug`) |
 |---|---|---|
-| `version` | semver | `1.2.0`; skills.sh imports pin `1.0.0` |
+| `version` | semver | `1.2.0`; skills.sh uses upstream semver when available, otherwise a content-derived `0.0.0+<hash>` |
 | `name` | string | non-empty |
 | `description` | string | non-empty; SKILL.md paragraph for imports |
 | `publisher` | `{id, verified?, official?}` | `id` required |
 | `topics` / `tags` | string[] | ranking signals (`tag:+2`) |
 | `pack` | string\|null | grouping |
-| `execution_modes` | 1+ of `instruction,tool,workflow,executable` | empty rejected; imports infer `executable` when runnable files (`.py`,`.sh`,`.js`,`.ts`,`.rb`,`.go`, `Dockerfile`, `Makefile`) are present, yielding a `sandbox-only` policy verdict |
+| `execution_modes` | 1+ of `instruction,tool,workflow,executable` | empty rejected; imports infer `executable` only for supported entrypoints (`.py`, `.sh`, `.js`), yielding a `sandbox-only` policy verdict |
 | `compatibility` | `{agent_classes[], harnesses[]}` | empty classes = universal |
 | `input_schema` / `output_schema` | object | tool I/O contract |
 | `tool_dependencies` | string[] | |
@@ -21,7 +21,7 @@ Strict subset of `schema/manifest.schema.json`. Unknown top-level keys rejected 
 | `deprecation` | `{deprecated,replaced_by}` | `deprecated` scores `-5` |
 | `popularity` | int ≥ 0 | `min(pop/100, 2)` in score |
 | `updated_at` | string\|null | |
-| `artifact` | `{instruction\|null, tool_ref\|null, files[]}` | instruction falls back to `description`; `files` = `{path,sha256,size}` metadata for supporting files |
+| `artifact` | `{instruction\|null, tool_ref\|null, workflow\|null, source_hash?, files[], entrypoints[]}` | instruction falls back to `description`; `source_hash` preserves upstream provenance separately from registry integrity; entrypoints must be declared files with a supported runtime |
 
 ## Deprecation / replacement
 
@@ -31,4 +31,4 @@ Strict subset of `schema/manifest.schema.json`. Unknown top-level keys rejected 
 
 ## Conformance
 
-Fixtures in `examples/conformance/`: `valid-instruction`, `valid-tool`, `invalid-bad-id`, `invalid-bad-version`, `invalid-unknown-field`, `revoked`. `Registry.add()` runs `normalize()` then strict `validate()`.
+Fixtures in `examples/conformance/`: `valid-instruction`, `valid-tool`, `invalid-bad-id`, `invalid-bad-version`, `invalid-unknown-field`, `revoked`. `Registry.add()` runs `normalize()` then strict manifest validation. The MCP `validate_skill` tool additionally checks the complete package: frontmatter identity, local Markdown references, file availability, and declared entrypoints. Its `strict` profile also requires `Contract`, `Anti-Patterns`, and `Output Format` sections.

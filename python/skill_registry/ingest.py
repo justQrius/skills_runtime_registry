@@ -5,10 +5,13 @@ Stdlib only (urllib.request). `to_manifest` is pure (no network);
 """
 import hashlib
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from .runtimes import is_supported_entrypoint
 
 
 def fetch_page(base: str, path: str, token: str, params: dict | None = None) -> dict:
@@ -41,14 +44,6 @@ def fetch_page(base: str, path: str, token: str, params: dict | None = None) -> 
         raise RuntimeError(f"skills.sh {e.code} {url}: {body}") from e
 
 
-def _is_runnable(path: str) -> bool:
-    name = path.rsplit("/", 1)[-1]
-    if name in ("Dockerfile", "Makefile"):
-        return True
-    ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    return ext in (".py", ".sh", ".js", ".ts", ".rb", ".go", ".ps1", ".bat")
-
-
 def _skill_md(detail: dict) -> str | None:
     files = detail.get("files") or []
     for f in files:
@@ -65,6 +60,15 @@ def _description(detail: dict, skill_md: str | None) -> str:
     if text.startswith("---"):
         end = text.find("\n---", 3)
         if end != -1:
+            frontmatter = text[3:end]
+            match = re.search(r"(?im)^description\s*:\s*(.+?)\s*$", frontmatter)
+            if match:
+                value = match.group(1).strip()
+                if ((value.startswith('"') and value.endswith('"')) or
+                        (value.startswith("'") and value.endswith("'"))):
+                    value = value[1:-1]
+                if value:
+                    return value[:500]
             text = text[end + 4:]
     for block in text.split("\n\n"):
         b = block.strip()
@@ -78,10 +82,15 @@ def to_manifest(detail: dict, audits: dict | None, extra: dict | None = None) ->
     """Map skills.sh detail + audits to a portable manifest (pure, no network)."""
     extra = extra or {}
     skill_id = detail["id"]
-    publisher_id = skill_id.rsplit("/", 1)[0] if "/" in skill_id else skill_id
+    id_parts = skill_id.split("/")
+    publisher_id = id_parts[0]
+    pack = "/".join(id_parts[:2]) if len(id_parts) >= 3 else None
     slug = detail.get("slug") or skill_id
     skill_md = _skill_md(detail)
-    topics = list(extra.get("topics", []))
+    topics = list(dict.fromkeys([
+        *extra.get("topics", []), *(detail.get("topics") or []),
+    ]))
+    tags = list(dict.fromkeys([*topics, *(detail.get("tags") or [])]))
     audit_list = (audits or {}).get("audits", []) if audits else []
     passed = [a for a in audit_list if a.get("status") == "pass"]
     audited = bool(passed)
@@ -91,7 +100,7 @@ def to_manifest(detail: dict, audits: dict | None, extra: dict | None = None) ->
         ref_slug = first.get("slug") or str(first.get("provider", "")).lower()
         audit_ref = f"skills.sh:{ref_slug}:{first.get('auditedAt')}"
     files_meta = []
-    executable = False
+    entrypoints = []
     for f in detail.get("files") or []:
         if not f.get("path"):
             continue
@@ -101,18 +110,24 @@ def to_manifest(detail: dict, audits: dict | None, extra: dict | None = None) ->
             "sha256": hashlib.sha256(raw).hexdigest(),
             "size": len(raw),
         })
-        if _is_runnable(f["path"]):
-            executable = True
-    modes = ["instruction", "executable"] if executable else ["instruction"]
-    return {
+        if is_supported_entrypoint(f["path"]):
+            entrypoints.append(f["path"])
+    modes = ["instruction", "executable"] if entrypoints else ["instruction"]
+    raw_version = detail.get("version")
+    if not isinstance(raw_version, str) or not re.match(
+            r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+].*)?$",
+            raw_version):
+        version_hash = re.sub(r"[^0-9A-Za-z.-]", "", str(detail.get("hash") or ""))[:12]
+        raw_version = "0.0.0" + (f"+{version_hash}" if version_hash else "")
+    manifest = {
         "skill_id": skill_id,
-        "version": "1.0.0",
+        "version": raw_version,
         "name": slug,
         "description": _description(detail, skill_md),
         "publisher": {"id": publisher_id},
         "topics": topics,
-        "tags": topics,
-        "pack": None,
+        "tags": tags,
+        "pack": pack,
         "execution_modes": modes,
         "compatibility": {"agent_classes": [], "harnesses": ["agnostic"]},
         "input_schema": {},
@@ -125,13 +140,20 @@ def to_manifest(detail: dict, audits: dict | None, extra: dict | None = None) ->
             "audit_ref": audit_ref,
             "revoked": False,
         },
-        "integrity": {"sha256": detail.get("hash")},
+        "integrity": {"sha256": None},
         "cache": {"ttl_seconds": 300, "pin_recommended": True},
         "deprecation": {"deprecated": False, "replaced_by": None},
         "popularity": int(detail.get("installs", 0) or 0),
-        "updated_at": None,
-        "artifact": {"instruction": skill_md, "tool_ref": None, "files": files_meta},
+        "updated_at": detail.get("updatedAt") or detail.get("updated_at"),
+        "artifact": {"instruction": skill_md, "tool_ref": None,
+                     "source_hash": detail.get("hash"),
+                     "files": files_meta, "entrypoints": entrypoints},
     }
+    from .manifest import normalize
+    manifest = normalize(manifest)
+    from .cache import digest as manifest_digest
+    manifest["integrity"]["sha256"] = manifest_digest(manifest)
+    return manifest
 
 
 def import_ids(
@@ -171,19 +193,19 @@ def import_ids(
         if (
             cached is not None
             and detail.get("hash")
-            and cached.get("integrity", {}).get("sha256") == detail.get("hash")
+            and cached.get("artifact", {}).get("source_hash") == detail.get("hash")
         ):
             m = cached
         else:
             m = to_manifest(detail, audits, {"official": detail.get("id", sid) in official_set})
             m = reg.add(m)
             cache.put(m, ttl=300)
-            for f in detail.get("files") or []:
-                if f.get("path") and f.get("contents") is not None:
-                    try:
-                        store.put(m["skill_id"], f["path"], f["contents"])
-                    except ValueError:
-                        pass  # oversize file: metadata stays, contents unavailable
+            package_files = [
+                (f["path"], f["contents"])
+                for f in detail.get("files") or []
+                if f.get("path") and f.get("contents") is not None
+            ]
+            store.put_bundle(m["skill_id"], m["version"], package_files)
         key = m["skill_id"]
         if key not in best or m.get("popularity", 0) > best[key].get("popularity", 0):
             best[key] = m

@@ -1,14 +1,10 @@
 """Resolve: policy-constrained ranking with rationale. Deterministic, stdlib only."""
 from .policy import decide
+from .search import relevance
 
-def _score(m: dict, tags: list[str], agent_class: str | None, modes: list[str]) -> tuple[float, list[str]]:
-    s = 0.0
-    why: list[str] = []
-    mt = [x.lower() for x in m.get("topics", []) + m.get("tags", [])]
-    for t in tags:
-        if t.lower() in mt:
-            s += 2.0
-            why.append(f"tag:{t}")
+def _score(m: dict, task: str, tags: list[str], agent_class: str | None,
+           modes: list[str]) -> tuple[float, list[str]]:
+    s, why = relevance(m, task, tags)
     if agent_class:
         classes = m.get("compatibility", {}).get("agent_classes", [])
         if not classes or agent_class in classes:
@@ -48,6 +44,8 @@ def resolve(
     require_review: bool = False,
     limit: int = 5,
 ) -> dict:
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("limit must be an integer from 1 to 100")
     tags = tags or []
     modes = allowed_modes or []
     # Hard policy filter first.
@@ -72,14 +70,6 @@ def resolve(
             if classes and agent_class not in classes:
                 continue
         cands.append(m)
-    hint_tags = [w.strip(".,").lower() for w in task.split() if len(w) > 3][:8]
-    seen: set[str] = set()
-    all_tags: list[str] = []
-    for t in (tags + hint_tags):
-        tl = t.lower()
-        if tl not in seen:
-            seen.add(tl)
-            all_tags.append(t)
     eff: dict = dict(policy) if policy else {}
     if allowlist is not None:
         eff.setdefault("allowlist", allowlist)
@@ -90,19 +80,29 @@ def resolve(
     if audited_only:
         eff.setdefault("require_audited", True)
     ranked = []
+    gated = []
     for m in cands:
         verdict, _reason = decide(m, eff)
         if verdict == "deny":
             continue
-        if verdict in ("require-review", "sandbox-only") and not require_review:
+        relevance_score, relevance_why = relevance(m, task, tags)
+        has_hint = bool(task.strip() or tags)
+        if has_hint and relevance_score <= 0:
             continue
-        s, why = _score(m, all_tags, agent_class, modes)
+        if verdict in ("require-review", "sandbox-only") and not require_review:
+            gated.append({
+                "skill_id": m["skill_id"], "version": m["version"],
+                "verdict": verdict, "reason": _reason,
+                "rationale": [*relevance_why, f"policy:{verdict}"],
+            })
+            continue
+        s, why = _score(m, task, tags, agent_class, modes)
         if verdict != "allow":
             why = [*why, f"policy:{verdict}"]
         ranked.append((s, m["skill_id"], m, why))
     ranked.sort(key=lambda r: (-r[0], r[1]))
     top = ranked[:limit]
-    return {
+    result = {
         "candidates": [
             {
                 "skill_id": m["skill_id"],
@@ -115,5 +115,10 @@ def resolve(
             }
             for s, _, m, why in top
         ],
-        "fallback": "fall back to native reasoning" if not top else None,
+        "fallback": (None if top else
+                     "matching skills require review" if gated else
+                     "fall back to native reasoning"),
     }
+    if gated:
+        result["review_candidates"] = gated[:limit]
+    return result

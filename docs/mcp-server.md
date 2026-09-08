@@ -54,13 +54,18 @@ Cloud mode serves JSON-RPC at `POST /mcp` plus `GET /healthz`
 
 | Tool | Args | Returns |
 |---|---|---|
-| `search` | `query, topic?, pack?, publisher?, agent_class?, execution_mode?, official_only?, audited_only?, include_revoked?, include_deprecated?, limit?` | slim cards: id, version, description, trust, popularity |
-| `resolve` | `task, tags?, agent_class?, allowed_modes?, allowlist?, denylist?, official_only?, audited_only?, policy?, require_review?, limit?` | ranked candidates with `rationale` + policy verdicts |
-| `load` | `skill_id, version?` | instruction context or tool binding + `files[]` metadata |
+| `search` | `query, topic?, pack?, publisher?, agent_class?, execution_mode?, official_only?, audited_only?, include_revoked?, include_deprecated?, limit?` | relevance-ranked cards with identity, discovery, trust, compatibility, permissions, modes, and entrypoints |
+| `resolve` | `task, tags?, agent_class?, allowed_modes?, allowlist?, denylist?, official_only?, audited_only?, policy?, require_review?, limit?` | relevant `candidates`, gated `review_candidates`, rationale, policy verdicts, and fallback |
+| `list_versions` | `skill_id` | semantic-version-ordered versions and latest |
+| `validate_skill` | `skill_id, version?, profile?` | package conformance report (`ecosystem` or `strict`) |
+| `load` | `skill_id, version?` | instruction context, workflow definition, or tool binding availability plus entrypoints and files |
 | `get_artifact` | `skill_id, version?` | instruction, tool_ref, input/output schemas |
-| `get_file` | `skill_id, path, version?` | verified file contents (sha256-checked, 1MB/file cap) |
+| `get_file` | `skill_id, path, version?` | one verified file (`contents` for UTF-8 and exact `contents_b64`) |
+| `get_files` | `skill_id, version?, paths?` | selected or all verified files in one round trip |
+| `get_package` | `skill_id, version?` | deterministic ZIP, package hash, and file inventory receipt |
+| `invoke_tool` | `skill_id, version?, input?, policy?, approved?` | schema-validated call through a configured server-side handler, or an explicit unavailable/gated result |
 | `refresh` | `ids[], official_ids?, admin_key?` | imports live from skills.sh (needs token + admin key over HTTP) |
-| `execute` | `skill_id, entrypoint, args?, inputs?, policy?, approved?, timeout_s?` | container run: stdout/stderr/exit_code/artifacts (`contents` + `contents_b64`), or `needs-approval` |
+| `execute` | `skill_id, version?, entrypoint, args?, inputs?, policy?, approved?, timeout_s?` | container run, separate stdout/stderr, dependencies, artifact receipt, or a gated result |
 ## Refresh auth
 
 `refresh` spends your token and writes into the server, so over HTTP it is
@@ -78,11 +83,15 @@ already share your privileges, so this is the correct trust boundary.
 ## Multi-file skills
 
 Manifests carry `artifact.files[] = {path, sha256, size}` (metadata only).
-`get_file` returns bytes only when they match the pinned hash; oversize
-files (>1MB) or bundles (>10MB) are refused at import. File contents persist
+Retrieval returns bytes only when they match the pinned hash; oversize files
+(>10MB) or bundles (>100MB) are refused at import. `get_files` avoids a
+round trip per file; `get_package` returns the entire verified tree as a
+deterministic uncompressed ZIP with its own hash and file inventory. Binary
+files use `contents_b64` and are never decoded lossily. File contents persist
 under `~/.skill-registry/files` (`--data` overrides, `/data/files` in Docker);
 imported manifests persist alongside (`*.manifest.json`) and reload on
-startup, so refreshes survive restarts. The catalog bundle
+startup, keyed by skill and version, so refreshes survive restarts and old
+versions remain addressable. The catalog bundle
 lives in `catalog/` (`--catalog` overrides).
 
 ## Telemetry
@@ -95,14 +104,17 @@ Same event names as the library.
 ## Exact execution (`execute` tool)
 
 `execute {skill_id, entrypoint, args?, inputs?, policy?, approved?, timeout_s?}`
-runs the skill's pinned file tree in a fresh container and returns
-`stdout/stderr/exit_code/duration_ms/image/artifacts`. Any pinned file can be
-the entrypoint (not just `SKILL.md`) — pick it from the `load` `files[]` list.
+runs the skill's pinned file tree in a fresh container and returns separate
+`stdout/stderr`, `exit_code`, `duration_ms`, image and dependency receipts,
+plus `artifacts` and `artifact_receipt`. Only paths declared in
+`artifact.entrypoints` may run — pick one from `load.entrypoints`.
 `artifacts` carry text in `contents` and exact bytes in `contents_b64`
-(both when ≤100KB/file, 500KB total). Mechanics:
+(both when ≤10MB/file). Up to 200 artifacts and 25MB total are returned;
+the receipt discloses count/byte truncation. Mechanics:
 
 - **Agent files in:** pass `inputs: [{path, text} | {path, b64}]`
-  (1MB/file, 10MB total, 50 files; traversal refused). They are staged to
+  (10MB/file, 50MB total, 100 files; traversal, duplicate paths, malformed
+  base64, and non-string args refused). They are staged to
   `/inputs/<path>` — reference them from `args`
   (e.g. `args: ["merge", "/inputs/a.pdf", "/inputs/b.pdf",
   "--output", "/scratch/merged.pdf"]`).
@@ -124,11 +136,14 @@ the entrypoint (not just `SKILL.md`) — pick it from the `load` `files[]` list.
   `docker cp` can retrieve `/scratch` (`docker cp` cannot see tmpfs
   mounts); skills read `/inputs`, write `/scratch`, and any tree
   tampering dies with the throwaway container.
-- **Dependencies:** `requirements.txt` (found anywhere in the tree, when
-  declared) installed into a per-skill-hash image, built once and reused
-  across runs and agents; images are versioned by build recipe
-  (`EXEC_RECIPE`) so recipe fixes never reuse stale layers.
-  Undeclared deps fail closed. Supported entrypoints: `.py`, `.sh`.
+- **Dependencies:** `requirements.txt` (found anywhere in the declared tree)
+  installs binary wheels into a per-skill-hash image, built once and reused.
+  Requirement directives, alternate indexes, URLs, VCS refs, and local paths
+  fail closed. The build has network only when packages must be fetched; the
+  execution container always has `--network none`. A dependency receipt
+  reports declared files/count and whether every package is exactly pinned.
+  Images are versioned by build recipe (`EXEC_RECIPE`) so runtime fixes never
+  reuse stale layers. Supported entrypoints: `.py`, `.sh`, `.js`.
 - **Host requirement:** the server needs a Docker daemon. In-container
   deployments mount it explicitly:
   `-v /var/run/docker.sock:/var/run/docker.sock` (grants the container
@@ -137,8 +152,10 @@ the entrypoint (not just `SKILL.md`) — pick it from the `load` `files[]` list.
 
 ## Safety model
 
-Policy runs inside `resolve`, before the agent sees anything: revoked and
-denylisted are dropped, unaudited/unofficial become `require-review`,
-executables become `sandbox-only`. Instruction context is served without
-YAML frontmatter (`get_file` returns raw bytes). Exact execution happens
-only in throwaway containers behind explicit approval — never in-process.
+Policy runs inside `resolve`: revoked and denylisted skills are dropped;
+unaudited/unofficial and executable matches are surfaced separately as review
+candidates unless the caller explicitly includes them. Instruction context is
+served without YAML frontmatter (`get_file` returns raw verified content).
+Tool invocation validates both declared schemas and only calls handlers
+configured by the embedding server. Exact execution happens only in throwaway
+containers behind explicit approval—never in-process.

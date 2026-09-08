@@ -1,4 +1,4 @@
-"""Agent-agnostic skill registry — Python core (stdlib only, Level 1)."""
+"""Agent-agnostic skill registry — Python core (stdlib only)."""
 from .store import Registry
 from .search import search
 from .resolve import resolve

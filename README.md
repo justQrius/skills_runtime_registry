@@ -4,13 +4,15 @@ Harness/agent/transport-agnostic on-demand skill registry. Fetches skills from
 [skills.sh](https://skills.sh) once, checks them always, and briefs whichever
 agent is on duty — with receipts.
 
-- **Search / rank under policy** — keyword + trust + compatibility ranking with
-  machine-readable rationale; revoked/denylisted dropped before any agent sees
-  them.
+- **Search / rank under policy** — relevance-first token/morphology matching
+  across descriptions, instructions, paths, topics, and tags; policy-gated
+  matches remain visible as review candidates with machine-readable rationale.
 - **Multi-file skills** — manifests pin every file (`path/sha256/size`);
-  contents served hash-verified from a verified store.
+  contents are served hash-verified individually, in bulk, or as a deterministic
+  ZIP with a package receipt.
 - **Exact execution** — script-bearing skills run in fresh network-isolated
-  containers behind explicit approval; instruction skills stay text-only.
+  containers behind explicit approval; Python, shell, and JavaScript entrypoints
+  are declared explicitly and instruction skills stay text-only.
 - **Any agent** — MCP server (stdio for local, HTTP for cloud) over the same
   stdlib-only core; Python + JS SDKs for embedding.
 
@@ -28,8 +30,10 @@ agent is on duty — with receipts.
   }
 }
 ```
-Tools: `search`, `resolve`, `load`, `get_artifact`, `get_file`, `refresh`
-(live import; needs `SKILLS_SH_TOKEN`), `execute` (container runs; approval-gated).
+Tools: `search`, `resolve`, `list_versions`, `validate_skill`, `load`,
+`get_artifact`, `get_file`, `get_files`, `get_package`, `invoke_tool`, `refresh`
+(live import; needs `SKILLS_SH_TOKEN`), and `execute` (container runs;
+approval-gated).
 
 **Run it in cloud:**
 
@@ -49,7 +53,7 @@ curl localhost:8125/healthz
 ```sh
 PYTHONPATH=python python python/demo.py   # end-to-end proof
 PYTHONPATH=python python -m unittest discover -s tests -v
-node --input-type=module -e "import('./js/index.js').then(m => console.log(typeof m.resolve))"
+node js/test.mjs
 ```
 | Path | What |
 |---|---|

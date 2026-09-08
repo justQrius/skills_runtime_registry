@@ -99,6 +99,11 @@
       "properties": {
         "instruction": { "type": ["string", "null"], "default": null },
         "tool_ref": { "type": ["string", "null"], "default": null },
+        "workflow": { "type": ["object", "null"], "default": null },
+        "source_hash": {
+          "type": ["string", "null"],
+          "description": "Optional upstream content hash; distinct from the registry manifest digest"
+        },
         "files": {
           "type": "array",
           "default": [],
@@ -112,6 +117,12 @@
             },
             "additionalProperties": false
           }
+        },
+        "entrypoints": {
+          "type": "array",
+          "default": [],
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
         }
       },
       "additionalProperties": false,

@@ -1,14 +1,18 @@
 """Skill-registry MCP server (stdlib only, NDJSON over stdio).
 
 Exposes the registry to any MCP-speaking agent: search, resolve, load,
-get_artifact, get_file, refresh. Stateless: every call carries its args.
+artifact delivery, tool invocation, refresh, and exact execution.
 
 Zero-touch: serves the bundled `catalog/` with no config. Set
 SKILLS_SH_TOKEN to enable the `refresh` tool (live import from skills.sh).
 """
+import base64
+import hashlib
+import io
 import json
 import os
 import sys
+import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -25,22 +29,31 @@ from skill_registry import (  # noqa: E402
 )
 
 NAME = "skill-registry"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def _slim(m: dict) -> dict:
     return {
         "skill_id": m["skill_id"],
         "version": m["version"],
+        "name": m["name"],
         "description": m["description"],
+        "publisher": m.get("publisher", {}),
+        "topics": m.get("topics", []),
+        "tags": m.get("tags", []),
+        "pack": m.get("pack"),
+        "permissions": m.get("permissions", {}),
+        "compatibility": m.get("compatibility", {}),
         "trust": m.get("trust", {}),
+        "integrity": m.get("integrity", {}),
         "popularity": m.get("popularity", 0),
         "execution_modes": m.get("execution_modes", []),
+        "entrypoints": m.get("artifact", {}).get("entrypoints", []),
     }
 
 class Server:
     def __init__(self, catalog: str | Path, data: str | Path | None = None,
-                 admin_key: str | None = None):
+                 admin_key: str | None = None, tool_handlers: dict | None = None):
         self.reg = Registry()
         self.reg.load_dir(str(catalog))
         default_data = Path.home() / ".skill-registry" / "files"
@@ -49,6 +62,7 @@ class Server:
         self.files = FileStore(self.data_dir)
         self.base = os.environ.get("SKILLS_SH_BASE", "https://skills.sh")
         self.admin_key = admin_key or os.environ.get("SKILL_REGISTRY_ADMIN_KEY")
+        self.tool_handlers = dict(tool_handlers or {})
         self.public = False  # set True by _serve_http; refresh is gated there
         self.tel = Telemetry(sink=self.data_dir / "telemetry.jsonl")
         for saved in sorted(self.data_dir.glob("*.manifest.json")):
@@ -58,11 +72,29 @@ class Server:
                 continue
 
     def _save_manifest(self, m: dict) -> None:
-        safe = "__".join(m["skill_id"].split("/")) + ".manifest.json"
+        safe = ("__".join(m["skill_id"].split("/")) + "__v__" +
+                m["version"].replace("/", "_").replace("\\", "_") +
+                ".manifest.json")
         try:
             (self.data_dir / safe).write_text(json.dumps(m))
         except OSError:
             pass
+
+    @staticmethod
+    def _limit(value, *, default: int, maximum: int = 100) -> int:
+        value = default if value is None else value
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
+            raise ValueError(f"limit must be an integer from 1 to {maximum}")
+        return value
+
+    def _manifest(self, skill_id: str, version: str | None = None) -> dict:
+        m = self.reg.get(skill_id, version)
+        if m is not None:
+            return m
+        if version is not None and self.reg.get(skill_id) is not None:
+            raise KeyError(f"unknown version: {skill_id}@{version}")
+        raise KeyError(f"unknown skill: {skill_id}")
+
     def t_search(self, a: dict) -> list:
         hits = search(
             self.reg.all(),
@@ -77,7 +109,7 @@ class Server:
             include_revoked=a.get("include_revoked", False),
             include_deprecated=a.get("include_deprecated", False),
         )
-        limit = a.get("limit", 10)
+        limit = self._limit(a.get("limit"), default=10)
         self.tel.emit("search.requested", query=a.get("query", ""))
         self.tel.emit("candidates.returned", count=len(hits))
         return [_slim(m) for m in hits[:limit]]
@@ -100,37 +132,68 @@ class Server:
         self.tel.emit("candidates.returned", count=len(out["candidates"]))
         return out
 
-    def t_load(self, a: dict) -> dict:
-        m = self.reg.get(a["skill_id"], a.get("version"))
-        if m is None:
-            self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
+    def t_list_versions(self, a: dict) -> dict:
+        versions = self.reg.versions(a["skill_id"])
+        if not versions:
             raise KeyError(f"unknown skill: {a['skill_id']}")
+        return {"skill_id": a["skill_id"], "versions": versions,
+                "latest": versions[0]}
+
+    def t_validate_skill(self, a: dict) -> dict:
+        from skill_registry.conformance import validate_package
+
+        m = self._manifest(a["skill_id"], a.get("version"))
+        return validate_package(
+            m,
+            lambda path: self.files.get_bytes(
+                m["skill_id"], path,
+                next((f.get("sha256") for f in m.get("artifact", {}).get("files", [])
+                      if f["path"] == path), None),
+                version=m["version"],
+            ),
+            profile=a.get("profile", "ecosystem"),
+        )
+
+    def t_load(self, a: dict) -> dict:
+        try:
+            m = self._manifest(a["skill_id"], a.get("version"))
+        except KeyError:
+            self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
+            raise
         self.tel.emit("skill.selected", skill_id=m["skill_id"])
         self.tel.emit("fetch.ok", skill_id=m["skill_id"])
         out = load_skill(m)
         out["skill_id"] = m["skill_id"]
         out["version"] = m["version"]
         out["files"] = m.get("artifact", {}).get("files", [])
+        if out["kind"] == "tool":
+            out["available"] = out["tool"] in self.tool_handlers
+            if not out["available"]:
+                out["availability_reason"] = "no server-side handler registered"
         return out
     def t_get_artifact(self, a: dict) -> dict:
-        art = self.reg.get_artifact(a["skill_id"], a.get("version"))
-        if art is None:
+        try:
+            m = self._manifest(a["skill_id"], a.get("version"))
+        except KeyError:
             self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
-            raise KeyError(f"unknown skill: {a['skill_id']}")
+            raise
+        art = self.reg.get_artifact(m["skill_id"], m["version"])
         self.tel.emit("fetch.ok", skill_id=art["skill_id"])
         return art
 
     def t_get_file(self, a: dict) -> dict:
-        m = self.reg.get(a["skill_id"], a.get("version"))
-        if m is None:
+        try:
+            m = self._manifest(a["skill_id"], a.get("version"))
+        except KeyError:
             self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
-            raise KeyError(f"unknown skill: {a['skill_id']}")
+            raise
         want = {f["path"]: f for f in m.get("artifact", {}).get("files", [])}
         meta = want.get(a["path"])
         if meta is None:
             self.tel.emit("fetch.fail", skill_id=m["skill_id"], path=a.get("path"))
             raise KeyError(f"unknown file: {a['path']}")
-        doc = self.files.get(m["skill_id"], a["path"], meta.get("sha256"))
+        doc = self.files.get(m["skill_id"], a["path"], meta.get("sha256"),
+                             version=m["version"])
         if doc is None:
             self.tel.emit("cache.miss", skill_id=m["skill_id"], path=a["path"])
             self.tel.emit("integrity.fail", skill_id=m["skill_id"], path=a["path"])
@@ -138,6 +201,73 @@ class Server:
         self.tel.emit("cache.hit", skill_id=m["skill_id"], path=a["path"])
         self.tel.emit("integrity.ok", skill_id=m["skill_id"], path=a["path"])
         return doc
+
+    def t_get_files(self, a: dict) -> dict:
+        """Fetch several or all verified files in one round trip."""
+        m = self._manifest(a["skill_id"], a.get("version"))
+        declared = [f["path"] for f in m.get("artifact", {}).get("files", [])]
+        paths = a.get("paths")
+        if paths is None:
+            paths = declared
+        if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+            raise ValueError("paths must be an array of strings")
+        if len(paths) > 500:
+            raise ValueError("too many paths (max 500)")
+        files = [self.t_get_file({"skill_id": m["skill_id"], "version": m["version"],
+                                  "path": path}) for path in paths]
+        return {"skill_id": m["skill_id"], "version": m["version"], "files": files}
+
+    def t_get_package(self, a: dict) -> dict:
+        """Return a deterministic ZIP containing the complete verified package."""
+        m = self._manifest(a["skill_id"], a.get("version"))
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as archive:
+            for meta in sorted(m.get("artifact", {}).get("files", []),
+                               key=lambda item: item["path"]):
+                raw = self.files.get_bytes(m["skill_id"], meta["path"],
+                                           meta.get("sha256"), version=m["version"])
+                if raw is None:
+                    raise KeyError(f"contents unavailable or hash mismatch: {meta['path']}")
+                info = zipfile.ZipInfo(meta["path"], date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_STORED
+                info.external_attr = 0o100644 << 16
+                archive.writestr(info, raw)
+        raw_zip = buf.getvalue()
+        return {"skill_id": m["skill_id"], "version": m["version"],
+                "file_count": len(m.get("artifact", {}).get("files", [])),
+                "files": m.get("artifact", {}).get("files", []),
+                "size": len(raw_zip), "sha256": hashlib.sha256(raw_zip).hexdigest(),
+                "contents_b64": base64.b64encode(raw_zip).decode("ascii")}
+
+    def t_invoke_tool(self, a: dict) -> dict:
+        """Invoke a configured implementation for a tool-mode skill."""
+        from skill_registry.policy import decide
+        from skill_registry.schema_validation import validate_instance
+
+        m = self._manifest(a["skill_id"], a.get("version"))
+        if "tool" not in m.get("execution_modes", []):
+            raise ValueError(f"skill is not tool-capable: {m['skill_id']}")
+        tool = m.get("artifact", {}).get("tool_ref")
+        verdict, reason = decide(m, a.get("policy") or {})
+        if verdict == "deny":
+            return {"status": "refused", "tool": tool, "verdict": verdict,
+                    "reason": reason}
+        if verdict != "allow" and not a.get("approved", False):
+            return {"status": "needs-approval", "tool": tool, "verdict": verdict,
+                    "reason": reason}
+        handler = self.tool_handlers.get(tool)
+        if handler is None:
+            return {"status": "unavailable", "tool": tool,
+                    "reason": "no server-side handler registered"}
+        value = a.get("input", {})
+        if not isinstance(value, dict):
+            raise ValueError("input must be an object")
+        validate_instance(value, m.get("input_schema", {}), "input")
+        output = handler(value)
+        validate_instance(output, m.get("output_schema", {}), "output")
+        self.tel.emit("skill.selected", skill_id=m["skill_id"])
+        return {"status": "ok", "skill_id": m["skill_id"], "version": m["version"],
+                "tool": tool, "output": output}
 
     def t_refresh(self, a: dict) -> dict:
         from skill_registry.ingest import import_ids
@@ -171,14 +301,16 @@ class Server:
     def t_execute(self, a: dict) -> dict:
         from skill_registry.execute import execute
 
-        m = self.reg.get(a["skill_id"], a.get("version"))
-        if m is None:
+        try:
+            m = self._manifest(a["skill_id"], a.get("version"))
+        except KeyError:
             self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
-            raise KeyError(f"unknown skill: {a['skill_id']}")
+            raise
         entrypoint = a.get("entrypoint", "")
         try:
             result = execute(
-                m, lambda p, s: self.files.get_bytes(m["skill_id"], p, s),
+                m, lambda p, s: self.files.get_bytes(m["skill_id"], p, s,
+                                                     version=m["version"]),
                 entrypoint, args=a.get("args"),
                 policy=a.get("policy"), approved=a.get("approved", False),
                 timeout_s=a.get("timeout_s", 120), inputs=a.get("inputs"))
@@ -191,6 +323,14 @@ class Server:
             self.tel.emit("execution.ok", skill_id=m["skill_id"],
                           entrypoint=entrypoint,
                           duration_ms=result.get("duration_ms"))
+        elif result["status"] == "failed":
+            self.tel.emit("execution.fail", skill_id=m["skill_id"],
+                          entrypoint=entrypoint,
+                          duration_ms=result.get("duration_ms"),
+                          exit_code=result.get("exit_code"))
+        elif result["status"] in ("refused", "needs-approval"):
+            self.tel.emit("skill.rejected", skill_id=m["skill_id"],
+                          reason=result.get("reason"), verdict=result.get("verdict"))
         return result
 
     TOOLS = {
@@ -207,6 +347,7 @@ class Server:
                 "audited_only": {"type": "boolean"},
                 "include_revoked": {"type": "boolean"},
                 "include_deprecated": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             }}),
         "resolve": ("Rank skills for a task under policy, with rationale.", {
             "type": "object",
@@ -221,8 +362,15 @@ class Server:
                 "audited_only": {"type": "boolean"},
                 "policy": {"type": "object"},
                 "require_review": {"type": "boolean"},
-                "limit": {"type": "integer"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             }}),
+        "list_versions": ("List available versions for a skill in semantic-version order.", {
+            "type": "object", "required": ["skill_id"],
+            "properties": {"skill_id": {"type": "string"}}}),
+        "validate_skill": ("Validate package structure, frontmatter, references, and entrypoints.", {
+            "type": "object", "required": ["skill_id"],
+            "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"},
+                            "profile": {"enum": ["ecosystem", "strict"]}}}),
         "load": ("Activate a skill: instruction context or tool binding plus file list.", {
             "type": "object", "required": ["skill_id"],
             "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"}}}),
@@ -233,6 +381,20 @@ class Server:
             "type": "object", "required": ["skill_id", "path"],
             "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"},
                             "path": {"type": "string"}}}),
+        "get_files": ("Fetch selected or all supporting files with verified text/base64 contents.", {
+            "type": "object", "required": ["skill_id"],
+            "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"},
+                            "paths": {"type": "array", "maxItems": 500,
+                                      "items": {"type": "string"}}}}),
+        "get_package": ("Fetch the complete verified package as a deterministic ZIP archive.", {
+            "type": "object", "required": ["skill_id"],
+            "properties": {"skill_id": {"type": "string"},
+                            "version": {"type": "string"}}}),
+        "invoke_tool": ("Invoke a configured implementation for a tool-mode skill.", {
+            "type": "object", "required": ["skill_id"],
+            "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"},
+                            "input": {"type": "object"}, "policy": {"type": "object"},
+                            "approved": {"type": "boolean"}}}),
         "refresh": ("Import skill ids live from skills.sh (needs SKILLS_SH_TOKEN; over HTTP also needs admin_key).", {
             "type": "object",
             "properties": {"ids": {"type": "array", "items": {"type": "string"}},
@@ -245,7 +407,8 @@ class Server:
                             "args": {"type": "array", "items": {"type": "string"}},
                             "inputs": {"type": "array", "items": {"type": "object"}},
                             "policy": {"type": "object"}, "approved": {"type": "boolean"},
-                            "timeout_s": {"type": "integer"}}}),
+                            "timeout_s": {"type": "integer", "minimum": 1,
+                                          "maximum": 600}}}),
     }
 
     # ----- JSON-RPC -----
@@ -283,8 +446,10 @@ class Server:
                 return err(-32004, str(e))
             except RuntimeError as e:
                 return err(-32003, str(e))
-            return ok({"content": [{"type": "text",
-                                    "text": json.dumps(result)}]})
+            payload = {"content": [{"type": "text", "text": json.dumps(result)}]}
+            if isinstance(result, dict) and result.get("status") in ("failed", "refused"):
+                payload["isError"] = True
+            return ok(payload)
         if method.startswith("notifications/"):
             return None
         if method == "ping":
