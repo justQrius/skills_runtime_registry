@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Secrets & local env
+.env
+.env.local
+.vercel/
+
+# Runtime artifacts
+telemetry-demo.jsonl
+*.manifest.json
+.skill-registry/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

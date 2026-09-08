@@ -1,0 +1,68 @@
+{
+  "skill_id": "acme/react-review",
+  "version": "1.2.0",
+  "name": "React Architecture Review",
+  "description": "Reviews React architecture decisions for maintainability and performance.",
+  "publisher": {
+    "id": "acme",
+    "verified": true,
+    "official": false
+  },
+  "topics": [
+    "react",
+    "design"
+  ],
+  "tags": [
+    "react",
+    "review",
+    "frontend"
+  ],
+  "execution_modes": [
+    "instruction"
+  ],
+  "compatibility": {
+    "agent_classes": [
+      "coding-agent",
+      "review-agent"
+    ],
+    "harnesses": [
+      "agnostic"
+    ]
+  },
+  "input_schema": {
+    "type": "object"
+  },
+  "output_schema": {
+    "type": "object"
+  },
+  "permissions": {
+    "network": false,
+    "filesystem": "read-only"
+  },
+  "trust": {
+    "official": false,
+    "audited": true,
+    "audit_ref": "audit-2026-001",
+    "revoked": true
+  },
+  "integrity": {
+    "sha256": "8f80208667c71e4799ce4d5e421497308c437331fafa3074c20e0f5b1fddaab1"
+  },
+  "cache": {
+    "ttl_seconds": 3600,
+    "pin_recommended": true
+  },
+  "popularity": 850,
+  "artifact": {
+    "instruction": "Review React components for purity, colocation, and memo boundaries.",
+    "tool_ref": null,
+    "files": []
+  },
+  "pack": null,
+  "tool_dependencies": [],
+  "deprecation": {
+    "deprecated": false,
+    "replaced_by": null
+  },
+  "updated_at": null
+}

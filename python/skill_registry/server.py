@@ -1,0 +1,397 @@
+"""Skill-registry MCP server (stdlib only, NDJSON over stdio).
+
+Exposes the registry to any MCP-speaking agent: search, resolve, load,
+get_artifact, get_file, refresh. Stateless: every call carries its args.
+
+Zero-touch: serves the bundled `catalog/` with no config. Set
+SKILLS_SH_TOKEN to enable the `refresh` tool (live import from skills.sh).
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent.parent
+sys.path.insert(0, str(HERE.parent))
+
+from skill_registry import (  # noqa: E402
+    FileStore,
+    Registry,
+    Telemetry,
+    load as load_skill,
+    resolve,
+    search,
+)
+
+NAME = "skill-registry"
+VERSION = "1.0.0"
+
+
+def _slim(m: dict) -> dict:
+    return {
+        "skill_id": m["skill_id"],
+        "version": m["version"],
+        "description": m["description"],
+        "trust": m.get("trust", {}),
+        "popularity": m.get("popularity", 0),
+        "execution_modes": m.get("execution_modes", []),
+    }
+
+class Server:
+    def __init__(self, catalog: str | Path, data: str | Path | None = None,
+                 admin_key: str | None = None):
+        self.reg = Registry()
+        self.reg.load_dir(str(catalog))
+        default_data = Path.home() / ".skill-registry" / "files"
+        self.data_dir = Path(data or str(default_data))
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.files = FileStore(self.data_dir)
+        self.base = os.environ.get("SKILLS_SH_BASE", "https://skills.sh")
+        self.admin_key = admin_key or os.environ.get("SKILL_REGISTRY_ADMIN_KEY")
+        self.public = False  # set True by _serve_http; refresh is gated there
+        self.tel = Telemetry(sink=self.data_dir / "telemetry.jsonl")
+        for saved in sorted(self.data_dir.glob("*.manifest.json")):
+            try:
+                self.reg.add(json.loads(saved.read_text()))
+            except (ValueError, json.JSONDecodeError, OSError):
+                continue
+
+    def _save_manifest(self, m: dict) -> None:
+        safe = "__".join(m["skill_id"].split("/")) + ".manifest.json"
+        try:
+            (self.data_dir / safe).write_text(json.dumps(m))
+        except OSError:
+            pass
+    def t_search(self, a: dict) -> list:
+        hits = search(
+            self.reg.all(),
+            a.get("query", ""),
+            topic=a.get("topic"),
+            pack=a.get("pack"),
+            publisher=a.get("publisher"),
+            agent_class=a.get("agent_class"),
+            execution_mode=a.get("execution_mode"),
+            official_only=a.get("official_only", False),
+            audited_only=a.get("audited_only", False),
+            include_revoked=a.get("include_revoked", False),
+            include_deprecated=a.get("include_deprecated", False),
+        )
+        limit = a.get("limit", 10)
+        self.tel.emit("search.requested", query=a.get("query", ""))
+        self.tel.emit("candidates.returned", count=len(hits))
+        return [_slim(m) for m in hits[:limit]]
+    def t_resolve(self, a: dict) -> dict:
+        self.tel.emit("search.requested", task=a.get("task", ""))
+        out = resolve(
+            self.reg.all(),
+            task=a.get("task", ""),
+            tags=a.get("tags"),
+            agent_class=a.get("agent_class"),
+            allowed_modes=a.get("allowed_modes"),
+            allowlist=a.get("allowlist"),
+            denylist=a.get("denylist"),
+            official_only=a.get("official_only", False),
+            audited_only=a.get("audited_only", False),
+            policy=a.get("policy"),
+            require_review=a.get("require_review", False),
+            limit=a.get("limit", 5),
+        )
+        self.tel.emit("candidates.returned", count=len(out["candidates"]))
+        return out
+
+    def t_load(self, a: dict) -> dict:
+        m = self.reg.get(a["skill_id"], a.get("version"))
+        if m is None:
+            self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
+            raise KeyError(f"unknown skill: {a['skill_id']}")
+        self.tel.emit("skill.selected", skill_id=m["skill_id"])
+        self.tel.emit("fetch.ok", skill_id=m["skill_id"])
+        out = load_skill(m)
+        out["skill_id"] = m["skill_id"]
+        out["version"] = m["version"]
+        out["files"] = m.get("artifact", {}).get("files", [])
+        return out
+    def t_get_artifact(self, a: dict) -> dict:
+        art = self.reg.get_artifact(a["skill_id"], a.get("version"))
+        if art is None:
+            self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
+            raise KeyError(f"unknown skill: {a['skill_id']}")
+        self.tel.emit("fetch.ok", skill_id=art["skill_id"])
+        return art
+
+    def t_get_file(self, a: dict) -> dict:
+        m = self.reg.get(a["skill_id"], a.get("version"))
+        if m is None:
+            self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
+            raise KeyError(f"unknown skill: {a['skill_id']}")
+        want = {f["path"]: f for f in m.get("artifact", {}).get("files", [])}
+        meta = want.get(a["path"])
+        if meta is None:
+            self.tel.emit("fetch.fail", skill_id=m["skill_id"], path=a.get("path"))
+            raise KeyError(f"unknown file: {a['path']}")
+        doc = self.files.get(m["skill_id"], a["path"], meta.get("sha256"))
+        if doc is None:
+            self.tel.emit("cache.miss", skill_id=m["skill_id"], path=a["path"])
+            self.tel.emit("integrity.fail", skill_id=m["skill_id"], path=a["path"])
+            raise KeyError(f"contents unavailable or hash mismatch: {a['path']}")
+        self.tel.emit("cache.hit", skill_id=m["skill_id"], path=a["path"])
+        self.tel.emit("integrity.ok", skill_id=m["skill_id"], path=a["path"])
+        return doc
+
+    def t_refresh(self, a: dict) -> dict:
+        from skill_registry.ingest import import_ids
+
+        token = os.environ.get("SKILLS_SH_TOKEN")
+        if not token:
+            return {"status": "unconfigured",
+                    "message": "Set SKILLS_SH_TOKEN to enable live refresh; serving bundled catalog."}
+        if self.public and not self.admin_key:
+            raise PermissionError("refresh disabled over HTTP: set SKILL_REGISTRY_ADMIN_KEY")
+        if self.admin_key and a.get("admin_key") != self.admin_key:
+            if a.get("_admin_key") != self.admin_key:
+                raise PermissionError("bad admin key")
+        ids = a.get("ids", [])
+        official = set(a.get("official_ids", []))
+        try:
+            ms = import_ids(ids, self.base, token,
+                            official_set=official or None, files=self.files)
+        except RuntimeError as e:
+            self.tel.emit("fetch.fail", ids=ids)
+            raise
+        for m in ms:
+            try:
+                self.reg.add(m)
+            except ValueError:
+                continue
+            self._save_manifest(m)
+        self.tel.emit("fetch.ok", count=len(ms))
+        return {"status": "ok", "imported": [_slim(m) for m in ms]}
+
+    def t_execute(self, a: dict) -> dict:
+        from skill_registry.execute import execute
+
+        m = self.reg.get(a["skill_id"], a.get("version"))
+        if m is None:
+            self.tel.emit("fetch.fail", skill_id=a.get("skill_id"))
+            raise KeyError(f"unknown skill: {a['skill_id']}")
+        entrypoint = a.get("entrypoint", "")
+        try:
+            result = execute(
+                m, lambda p, s: self.files.get_bytes(m["skill_id"], p, s),
+                entrypoint, args=a.get("args"),
+                policy=a.get("policy"), approved=a.get("approved", False),
+                timeout_s=a.get("timeout_s", 120))
+        except (ValueError, RuntimeError) as e:
+            self.tel.emit("execution.fail", skill_id=m["skill_id"],
+                          entrypoint=entrypoint)
+            raise
+        if result["status"] == "ok":
+            self.tel.emit("skill.selected", skill_id=m["skill_id"])
+            self.tel.emit("execution.ok", skill_id=m["skill_id"],
+                          entrypoint=entrypoint,
+                          duration_ms=result.get("duration_ms"))
+        return result
+
+    TOOLS = {
+        "search": ("Find skills by keyword and filters.", {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "topic": {"type": "string"},
+                "pack": {"type": "string"},
+                "publisher": {"type": "string"},
+                "agent_class": {"type": "string"},
+                "execution_mode": {"type": "string"},
+                "official_only": {"type": "boolean"},
+                "audited_only": {"type": "boolean"},
+                "include_revoked": {"type": "boolean"},
+                "include_deprecated": {"type": "boolean"},
+            }}),
+        "resolve": ("Rank skills for a task under policy, with rationale.", {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "agent_class": {"type": "string"},
+                "allowed_modes": {"type": "array", "items": {"type": "string"}},
+                "allowlist": {"type": "array", "items": {"type": "string"}},
+                "denylist": {"type": "array", "items": {"type": "string"}},
+                "official_only": {"type": "boolean"},
+                "audited_only": {"type": "boolean"},
+                "policy": {"type": "object"},
+                "require_review": {"type": "boolean"},
+                "limit": {"type": "integer"},
+            }}),
+        "load": ("Activate a skill: instruction context or tool binding plus file list.", {
+            "type": "object", "required": ["skill_id"],
+            "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"}}}),
+        "get_artifact": ("Fetch a skill's manifest payload (instruction, tool_ref, schemas).", {
+            "type": "object", "required": ["skill_id"],
+            "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"}}}),
+        "get_file": ("Fetch one supporting file's verified contents.", {
+            "type": "object", "required": ["skill_id", "path"],
+            "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"},
+                            "path": {"type": "string"}}}),
+        "refresh": ("Import skill ids live from skills.sh (needs SKILLS_SH_TOKEN; over HTTP also needs admin_key).", {
+            "type": "object",
+            "properties": {"ids": {"type": "array", "items": {"type": "string"}},
+                            "official_ids": {"type": "array", "items": {"type": "string"}},
+                            "admin_key": {"type": "string"}}}),
+        "execute": ("Run a skill entrypoint in a fresh network-isolated container; non-allow verdicts need approved:true.", {
+            "type": "object", "required": ["skill_id", "entrypoint"],
+            "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"},
+                            "entrypoint": {"type": "string"},
+                            "args": {"type": "array", "items": {"type": "string"}},
+                            "policy": {"type": "object"}, "approved": {"type": "boolean"},
+                            "timeout_s": {"type": "integer"}}}),
+    }
+
+    # ----- JSON-RPC -----
+    def handle(self, msg: dict):
+        mid = msg.get("id")
+        method = msg.get("method", "")
+
+        def ok(result):
+            return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+        def err(code, message):
+            return {"jsonrpc": "2.0", "id": mid,
+                    "error": {"code": code, "message": message}}
+
+        if method == "initialize":
+            return ok({"protocolVersion": "2024-11-05",
+                       "capabilities": {"tools": {}},
+                       "serverInfo": {"name": NAME, "version": VERSION}})
+        if method == "tools/list":
+            return ok({"tools": [
+                {"name": n, "description": d, "inputSchema": s}
+                for n, (d, s) in self.TOOLS.items()]})
+        if method == "tools/call":
+            p = msg.get("params", {})
+            fn = getattr(self, "t_" + p.get("name", "").replace("-", "_"), None)
+            if fn is None:
+                return err(-32601, f"unknown tool: {p.get('name')}")
+            try:
+                result = fn(p.get("arguments", {}))
+            except KeyError as e:
+                return err(-32002, str(e))
+            except ValueError as e:
+                return err(-32001, str(e))
+            except PermissionError as e:
+                return err(-32004, str(e))
+            except RuntimeError as e:
+                return err(-32003, str(e))
+            return ok({"content": [{"type": "text",
+                                    "text": json.dumps(result)}]})
+        if method.startswith("notifications/"):
+            return None
+        if method == "ping":
+            return ok({})
+        return err(-32601, f"unknown method: {method}")
+
+
+def main() -> None:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Skill-registry MCP server (stdio or HTTP).")
+    ap.add_argument("--catalog", default=str(REPO_ROOT / "catalog"))
+    ap.add_argument("--data", default=os.environ.get("SKILL_REGISTRY_DATA"))
+    ap.add_argument("--http", type=int, default=0, metavar="PORT",
+                    help="serve JSON-RPC over HTTP on PORT instead of stdio")
+    ap.add_argument("--host", default="127.0.0.1")
+    args = ap.parse_args()
+
+    srv = Server(args.catalog, args.data,
+                 admin_key=os.environ.get("SKILL_REGISTRY_ADMIN_KEY"))
+    if args.http:
+        srv.public = True
+        _serve_http(srv, args.host, args.http)
+    stdin = sys.stdin
+    stdout = sys.stdout
+    for line in stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as e:
+            stdout.write(json.dumps(
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32700, "message": str(e)}}) + "\n")
+            stdout.flush()
+            continue
+        resp = srv.handle(msg)
+        if resp is not None:
+            stdout.write(json.dumps(resp) + "\n")
+            stdout.flush()
+
+
+
+def _serve_http(srv: Server, host: str, port: int) -> None:
+    """Cloud mode: POST /mcp (JSON-RPC) + GET /healthz. Stdlib only."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    log = sys.stderr
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = NAME + "/" + VERSION
+
+        def log_message(self, fmt, *args):
+            log.write("mcp-http %s\n" % (fmt % args))
+
+        def _send(self, code: int, obj: dict) -> None:
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self._send(200, {"status": "ok", "server": NAME,
+                                 "version": VERSION,
+                                 "skills": len(srv.reg.all())})
+                return
+            self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path != "/mcp":
+                self._send(404, {"error": "not found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 2_000_000:
+                self._send(400, {"jsonrpc": "2.0", "id": None,
+                                 "error": {"code": -32600,
+                                           "message": "missing or oversize body"}})
+                return
+            try:
+                msg = json.loads(self.rfile.read(length))
+            except (json.JSONDecodeError, OSError) as e:
+                self._send(400, {"jsonrpc": "2.0", "id": None,
+                                 "error": {"code": -32700, "message": str(e)}})
+                return
+            key = self.headers.get("X-Admin-Key")
+            if key and isinstance(msg, dict):
+                params = msg.setdefault("params", {})
+                if isinstance(params, dict):
+                    args = params.setdefault("arguments", {})
+                    if isinstance(args, dict):
+                        args.setdefault("_admin_key", key)
+            resp = srv.handle(msg)
+            self._send(200, resp or {"jsonrpc": "2.0", "id": msg.get("id"),
+                                     "result": {"accepted": True}})
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    log.write(f"{NAME} http on {host}:{port}\n")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+if __name__ == "__main__":
+    main()

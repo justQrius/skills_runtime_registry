@@ -1,0 +1,66 @@
+{
+  "skill_id": "official/procurement-flow",
+  "version": "2.0.1",
+  "name": "Procurement Workflow",
+  "description": "Niche procurement approval workflow for enterprise automation.",
+  "publisher": {
+    "id": "official",
+    "verified": true,
+    "official": true
+  },
+  "topics": [
+    "procurement",
+    "ecommerce"
+  ],
+  "tags": [
+    "procurement",
+    "workflow"
+  ],
+  "execution_modes": [
+    "tool"
+  ],
+  "compatibility": {
+    "agent_classes": [
+      "workflow-agent"
+    ],
+    "harnesses": [
+      "agnostic"
+    ]
+  },
+  "input_schema": {
+    "type": "object"
+  },
+  "output_schema": {
+    "type": "object"
+  },
+  "permissions": {
+    "network": false,
+    "filesystem": "none"
+  },
+  "trust": {
+    "official": true,
+    "audited": true,
+    "audit_ref": "audit-2026-014",
+    "revoked": false
+  },
+  "integrity": {
+    "sha256": "61fa7db4fb9cb1be726eeaf4ec7409caed705b6234e3ad9553646414cbf2807a"
+  },
+  "cache": {
+    "ttl_seconds": 7200,
+    "pin_recommended": true
+  },
+  "popularity": 120,
+  "artifact": {
+    "tool_ref": "procurement.approve",
+    "instruction": null,
+    "files": []
+  },
+  "pack": null,
+  "tool_dependencies": [],
+  "deprecation": {
+    "deprecated": false,
+    "replaced_by": null
+  },
+  "updated_at": null
+}
