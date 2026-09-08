@@ -60,7 +60,7 @@ Cloud mode serves JSON-RPC at `POST /mcp` plus `GET /healthz`
 | `get_artifact` | `skill_id, version?` | instruction, tool_ref, input/output schemas |
 | `get_file` | `skill_id, path, version?` | verified file contents (sha256-checked, 1MB/file cap) |
 | `refresh` | `ids[], official_ids?, admin_key?` | imports live from skills.sh (needs token + admin key over HTTP) |
-| `execute` | `skill_id, entrypoint, args?, policy?, approved?, timeout_s?` | container run: stdout/stderr/exit_code/artifacts, or `needs-approval` |
+| `execute` | `skill_id, entrypoint, args?, inputs?, policy?, approved?, timeout_s?` | container run: stdout/stderr/exit_code/artifacts (`contents` + `contents_b64`), or `needs-approval` |
 ## Refresh auth
 
 `refresh` spends your token and writes into the server, so over HTTP it is
@@ -94,19 +94,36 @@ Same event names as the library.
 
 ## Exact execution (`execute` tool)
 
-`execute {skill_id, entrypoint, args?, policy?, approved?, timeout_s?}`
+`execute {skill_id, entrypoint, args?, inputs?, policy?, approved?, timeout_s?}`
 runs the skill's pinned file tree in a fresh container and returns
-`stdout/stderr/exit_code/duration_ms/image/artifacts`. Mechanics:
+`stdout/stderr/exit_code/duration_ms/image/artifacts`. Any pinned file can be
+the entrypoint (not just `SKILL.md`) — pick it from the `load` `files[]` list.
+`artifacts` carry text in `contents` and exact bytes in `contents_b64`
+(both when ≤100KB/file, 500KB total). Mechanics:
 
+- **Agent files in:** pass `inputs: [{path, text} | {path, b64}]`
+  (1MB/file, 10MB total, 50 files; traversal refused). They are staged to
+  `/inputs/<path>` — reference them from `args`
+  (e.g. `args: ["merge", "/inputs/a.pdf", "/inputs/b.pdf",
+  "--output", "/scratch/merged.pdf"]`).
+- **Skill outputs out:** the skill writes results to `/scratch/<path>`;
+  everything under `/scratch` returns as `artifacts` (hash-pinned
+  `path/size/sha256` + payload). Binary outputs (PDFs, images) arrive as
+  `contents_b64` — decode to exact bytes.
 - **Gate first:** the caller's `policy` runs through `decide`. Anything but
   `allow` (e.g. `sandbox-only` for script-bearing skills) needs
   `approved: true`, else the result is `needs-approval` and nothing runs.
 - **Exact tree:** all pinned files materialized byte-identical, relative
   paths preserved; unknown entrypoints and path traversal refused. Runs
-  are copy-free (tree baked into the per-hash image, scratch on tmpfs),
+  are copy-free (tree baked into the per-hash image, `/scratch` + `/inputs`
+  dirs baked into the image, agent inputs in an ephemeral per-run layer),
   so execution works whether the server runs on the host or in a container.
-- **Isolation:** `--network none`, read-only tree, 64MB tmpfs scratch,
-  512MB RAM, 1 CPU, 120s default timeout; container removed after.
+- **Isolation:** `--network none` (no bind mounts — tree and inputs ride
+  image layers), 512MB RAM, 1 CPU, 120s default timeout; container +
+  ephemeral input layer removed after. The container layer is writable so
+  `docker cp` can retrieve `/scratch` (`docker cp` cannot see tmpfs
+  mounts); skills read `/inputs`, write `/scratch`, and any tree
+  tampering dies with the throwaway container.
 - **Dependencies:** `requirements.txt` (found anywhere in the tree, when
   declared) installed into a per-skill-hash image, built once and reused
   across runs and agents; images are versioned by build recipe

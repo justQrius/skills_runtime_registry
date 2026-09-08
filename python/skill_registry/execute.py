@@ -6,6 +6,7 @@ returns `needs-approval` without touching Docker. Each run materializes the
 pinned file tree fresh, runs one entrypoint with no network, then destroys
 the container — no state survives between runs or agents.
 """
+import base64
 import os
 import shutil
 import subprocess
@@ -21,11 +22,13 @@ RUNNERS = {
     ".py": ("python:3.12-slim", ["python"]),
     ".sh": ("python:3.12-slim", ["sh"]),
 }
-
 DEFAULT_TIMEOUT_S = 120
 OUTPUT_LIMIT = 500_000
 ARTIFACT_TEXT_LIMIT = 100_000
 MAX_ARTIFACTS = 50
+INPUT_FILE_LIMIT = 1_000_000
+INPUT_BUNDLE_LIMIT = 10_000_000
+MAX_INPUTS = 50
 
 
 def gate(manifest: dict, policy: dict | None, approved: bool = False) -> dict:
@@ -36,6 +39,14 @@ def gate(manifest: dict, policy: dict | None, approved: bool = False) -> dict:
     if verdict != "allow" and not approved:
         return {"status": "needs-approval", "verdict": verdict, "reason": reason}
     return {"status": "ok", "verdict": verdict, "reason": reason}
+
+
+def _unsafe_path(path: str) -> bool:
+    """True for absolute (POSIX, Windows, drive-letter) or `..`-escaping paths."""
+    parts = Path(path).parts
+    absolute = (Path(path).is_absolute() or path.startswith(("/", "\\"))
+                or (len(path) > 1 and path[1] == ":"))
+    return (not path) or absolute or ".." in parts
 
 
 def materialize(manifest: dict, read_bytes, dest: str | Path) -> list[str]:
@@ -51,7 +62,7 @@ def materialize(manifest: dict, read_bytes, dest: str | Path) -> list[str]:
     written = []
     for path, meta in sorted(wanted.items()):
         parts = Path(path).parts
-        if Path(path).is_absolute() or ".." in parts:
+        if _unsafe_path(path):
             raise ValueError(f"unsafe path: {path}")
         raw = read_bytes(path, meta.get("sha256"))
         if raw is None:
@@ -62,8 +73,61 @@ def materialize(manifest: dict, read_bytes, dest: str | Path) -> list[str]:
         written.append(path)
     return written
 
+def parse_inputs(inputs: list[dict] | None) -> list[tuple[str, bytes]]:
+    """Validate agent-supplied input files into (relpath, bytes) pairs.
 
-EXEC_RECIPE = "2"  # bump when the generated Dockerfile changes (invalidates cache)
+    Each entry is {"path": rel, "text": str} or {"path": rel, "b64": str}.
+    Same traversal rules as `materialize`; 1MB/file, 10MB total, 50 files.
+    Raises ValueError on any violation.
+    """
+    if not inputs:
+        return []
+    if len(inputs) > MAX_INPUTS:
+        raise ValueError(f"too many inputs: {len(inputs)} (max {MAX_INPUTS})")
+    out: list[tuple[str, bytes]] = []
+    total = 0
+    for entry in inputs:
+        if not isinstance(entry, dict):
+            raise ValueError("input must be {path, text|b64}")
+        path = entry.get("path", "")
+        if _unsafe_path(path):
+            raise ValueError(f"unsafe input path: {path!r}")
+        has_text = "text" in entry
+        has_b64 = "b64" in entry
+        if has_text == has_b64:
+            raise ValueError(f"input {path!r} needs exactly one of text|b64")
+        if has_b64:
+            try:
+                raw = base64.b64decode(entry["b64"], validate=True)
+            except Exception:
+                raise ValueError(f"input {path!r}: invalid base64") from None
+        else:
+            text = entry["text"]
+            if not isinstance(text, str):
+                raise ValueError(f"input {path!r}: text must be a string")
+            raw = text.encode("utf-8")
+        if len(raw) > INPUT_FILE_LIMIT:
+            raise ValueError(f"input too large: {path} ({len(raw)} bytes)")
+        total += len(raw)
+        if total > INPUT_BUNDLE_LIMIT:
+            raise ValueError("inputs too large (max 10MB total)")
+        out.append((path, raw))
+    return out
+
+
+def stage_inputs(parsed: list[tuple[str, bytes]], dest: str | Path) -> list[str]:
+    """Write validated inputs under `dest`, preserving relative paths."""
+    dest = Path(dest)
+    written = []
+    for path, raw in parsed:
+        target = dest.joinpath(*Path(path).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        written.append(path)
+    return written
+
+
+EXEC_RECIPE = "3"  # bump when the generated Dockerfile changes (invalidates cache)
 
 
 def image_tag(manifest: dict) -> str:
@@ -88,7 +152,12 @@ def ensure_image(manifest: dict, tree: Path, base_image: str) -> str:
                           capture_output=True, text=True, timeout=60)
     if have.stdout.strip():
         return tag
-    dockerfile = f"FROM {base_image}\nCOPY . /skill\nWORKDIR /skill\n"
+    # /scratch + /inputs are plain dirs on the container layer (NOT tmpfs:
+    # `docker cp` cannot see tmpfs mounts, so artifacts would come back
+    # empty). No `--read-only` flag for the same reason; the container is
+    # still throwaway (`--network none`, capped, removed after).
+    dockerfile = (f"FROM {base_image}\nCOPY . /skill\nWORKDIR /skill\n"
+                  f"RUN mkdir -p /scratch /inputs\n")
     for req in sorted(tree.rglob("requirements.txt")):
         dockerfile += f"RUN pip install --no-cache-dir -r {req.relative_to(tree).as_posix()}\n"
     (tree / "Dockerfile.exec").write_text(dockerfile)
@@ -118,7 +187,10 @@ def collect_artifacts(scratch: Path) -> list[dict]:
                                  else text[:ARTIFACT_TEXT_LIMIT] + "\n…[truncated]")
         except UnicodeDecodeError:
             entry["contents"] = None
-            entry["note"] = "binary omitted"
+        if len(raw) <= ARTIFACT_TEXT_LIMIT:
+            entry["contents_b64"] = base64.b64encode(raw).decode()
+        else:
+            entry["note"] = "artifact too large: b64 omitted"
         out.append(entry)
     return out
 
@@ -127,8 +199,16 @@ def execute(manifest: dict, read_bytes, entrypoint: str,
             args: list[str] | None = None,
             policy: dict | None = None, approved: bool = False,
             timeout_s: int = DEFAULT_TIMEOUT_S,
+            inputs: list[dict] | None = None,
             work_root: str | Path | None = None) -> dict:
-    """Run `entrypoint` from the skill's pinned tree in a fresh container."""
+    """Run `entrypoint` from the skill's pinned tree in a fresh container.
+
+    `inputs` (optional): agent files staged to `/inputs`
+    (`{path, text}` or `{path, b64}`; 1MB/file, 10MB total). Reference them
+    from `args` as `/inputs/<path>`; write results to `/scratch/<path>` —
+    everything under `/scratch` returns as `artifacts` (text in `contents`,
+    exact bytes in `contents_b64` when <=100KB).
+    """
     g = gate(manifest, policy, approved)
     if g["status"] != "ok":
         return {**g, "skill_id": manifest["skill_id"]}
@@ -138,24 +218,43 @@ def execute(manifest: dict, read_bytes, entrypoint: str,
     if entrypoint not in files:
         raise ValueError(f"unknown entrypoint: {entrypoint}")
     image, prefix = runner_for(entrypoint)
+    parsed = parse_inputs(inputs)
 
     owned_root = work_root is None
     root = Path(work_root) if work_root else Path(tempfile.mkdtemp(prefix="skill-exec-"))
     try:
         tree = root / "tree"
         scratch = root / "scratch"
+        staged = root / "staged-inputs"
         tree.mkdir(parents=True, exist_ok=True)
         scratch.mkdir(parents=True, exist_ok=True)
+        staged.mkdir(parents=True, exist_ok=True)
         materialize(manifest, read_bytes, tree)
-        tag = ensure_image(manifest, tree, image)
+        stage_inputs(parsed, staged)
+        base_tag = ensure_image(manifest, tree, image)
+        # Agent inputs ride an ephemeral per-run layer over the cached
+        # skill image (COPY, never a bind mount). Still
+        # Docker-out-of-Docker safe.
+        tag = base_tag
+        run_tag: str | None = None
+        if parsed:
+            run_tag = f"skill-run-{int(time.time() * 1000)}-{os.getpid()}"
+            (staged / "Dockerfile.run").write_text(f"FROM {base_tag}\nCOPY . /inputs\n")
+            build = subprocess.run(
+                ["docker", "build", "-f", "Dockerfile.run", "-t", run_tag, "."],
+                cwd=str(staged), capture_output=True, text=True, timeout=300)
+            if build.returncode != 0:
+                raise RuntimeError(f"input layer build failed: {build.stderr[-2000:]}")
+            tag = run_tag
         name = f"skill-exec-{int(time.time() * 1000)}-{os.getpid()}"
         # Copy-free (no bind mounts): the per-hash image already contains the
-        # exact tree via COPY; scratch is a tmpfs. Works whether the server
-        # runs on the host or in a container (Docker-out-of-Docker safe).
+        # exact tree via COPY; /scratch + /inputs are plain container-layer
+        # dirs so `docker cp` can retrieve outputs (it cannot see tmpfs).
+        # Works whether the server runs on the host or in a container
+        # (Docker-out-of-Docker safe).
         create = ["docker", "create", "--name", name,
-                  "--network", "none", "--read-only",
+                  "--network", "none",
                   "--memory", "512m", "--cpus", "1",
-                  "--tmpfs", "/scratch:rw,size=64m",
                   "-w", "/skill",
                   tag, *(prefix + [f"/skill/{entrypoint}", *(args or [])])]
         t0 = time.perf_counter()
@@ -187,16 +286,20 @@ def execute(manifest: dict, read_bytes, entrypoint: str,
         finally:
             subprocess.run(["docker", "rm", "-f", name],
                            capture_output=True, timeout=30)
+            if run_tag is not None:
+                subprocess.run(["docker", "rmi", "-f", run_tag],
+                               capture_output=True, timeout=120)
         ms = round((time.perf_counter() - t0) * 1000, 1)
-        # `docker logs` merges streams; stdout carries the combined output.
-        combined = (logs.stdout or "")[-OUTPUT_LIMIT:]
+        # `docker logs` splits streams across stdout/stderr; surface both so
+        # tracebacks (stderr) are never silently dropped.
+        combined = ((logs.stdout or "") + (logs.stderr or ""))[-OUTPUT_LIMIT:]
         return {"status": "ok" if exit_code == 0 else "failed",
                 "skill_id": manifest["skill_id"],
                 "entrypoint": entrypoint,
                 "verdict": g["verdict"],
                 "exit_code": exit_code,
                 "stdout": combined, "stderr": "",
-                "duration_ms": ms, "image": tag,
+                "duration_ms": ms, "image": base_tag,
                 "artifacts": collect_artifacts(scratch)}
     finally:
         if owned_root:

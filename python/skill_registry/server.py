@@ -181,7 +181,7 @@ class Server:
                 m, lambda p, s: self.files.get_bytes(m["skill_id"], p, s),
                 entrypoint, args=a.get("args"),
                 policy=a.get("policy"), approved=a.get("approved", False),
-                timeout_s=a.get("timeout_s", 120))
+                timeout_s=a.get("timeout_s", 120), inputs=a.get("inputs"))
         except (ValueError, RuntimeError) as e:
             self.tel.emit("execution.fail", skill_id=m["skill_id"],
                           entrypoint=entrypoint)
@@ -238,11 +238,12 @@ class Server:
             "properties": {"ids": {"type": "array", "items": {"type": "string"}},
                             "official_ids": {"type": "array", "items": {"type": "string"}},
                             "admin_key": {"type": "string"}}}),
-        "execute": ("Run a skill entrypoint in a fresh network-isolated container; non-allow verdicts need approved:true.", {
+        "execute": ("Run a skill entrypoint in a fresh network-isolated container; non-allow verdicts need approved:true. Pass agent files as inputs[{path, text|b64}] (staged to /inputs); write outputs to /scratch (returned as artifacts with contents + contents_b64).", {
             "type": "object", "required": ["skill_id", "entrypoint"],
             "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"},
                             "entrypoint": {"type": "string"},
                             "args": {"type": "array", "items": {"type": "string"}},
+                            "inputs": {"type": "array", "items": {"type": "object"}},
                             "policy": {"type": "object"}, "approved": {"type": "boolean"},
                             "timeout_s": {"type": "integer"}}}),
     }

@@ -4,11 +4,23 @@ All notable changes, newest first. Updated every iteration.
 
 ## Unreleased
 
+- `execute` inputs plane: `inputs: [{path, text} | {path, b64}]` staged to
+  `/inputs/<path>` (1MB/file, 10MB total, traversal refused; baked into an
+  ephemeral per-run layer over the cached skill image). Any pinned file
+  already runs as `entrypoint`. Skill writes to `/scratch/<path>`; artifacts
+  now add `contents_b64` (exact bytes ≤100KB, incl. binaries) alongside
+  `contents`. Container stderr merged into `stdout` (tracebacks no longer
+  dropped); traversal check hardened cross-platform (shared helper).
+- Fixed: `/scratch` was a tmpfs mount, which `docker cp` cannot see — every
+  run returned `artifacts: []`. `/scratch` + `/inputs` are now plain dirs
+  baked into the image (`EXEC_RECIPE` 2→3, stale images invalidated);
+  `--read-only` dropped for the same reason (throwaway container still:
+  `--network none`, capped, removed after with its input layer).
 - Exact execution: `skill_registry.execute` (gate → materialize pinned
   tree → per-hash image → fresh `--network none` container → artifacts +
   receipt) and MCP `execute` tool (approval-gated, telemetry
-  `execution.ok|fail`). Copy-free runs (tree baked in image, tmpfs
-  scratch) for Docker-out-of-Docker; `requirements.txt` found anywhere;
+  `execution.ok|fail`). Copy-free runs (tree baked in image, plain
+  `/scratch` dir) for Docker-out-of-Docker; `requirements.txt` found anywhere;
   images tagged with build recipe (`EXEC_RECIPE`).
 - Security: `refresh` over HTTP needs `SKILL_REGISTRY_ADMIN_KEY`
   (`admin_key` arg or `X-Admin-Key` header; `-32004` on denial).

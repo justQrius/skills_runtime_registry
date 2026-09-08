@@ -417,6 +417,43 @@ class ExecuteTest(unittest.TestCase):
         self.assertEqual(gate(self.manifest(), None, False)["status"], "needs-approval")
         self.assertEqual(gate(self.manifest(), None, True)["status"], "ok")
 
+    def test_inputs_validated(self):
+        from skill_registry.execute import parse_inputs
+        self.assertEqual(parse_inputs(None), [])
+        self.assertEqual(parse_inputs([]), [])
+        self.assertEqual(parse_inputs([{"path": "a.txt", "text": "hi"}]),
+                         [("a.txt", b"hi")])
+        self.assertEqual(parse_inputs([{"path": "b.bin", "b64": "aGk="}]),
+                         [("b.bin", b"hi")])
+        for bad in ({"path": "../evil.txt", "text": "x"},
+                    {"path": "/abs.txt", "text": "x"},
+                    {"path": "a.txt"},
+                    {"path": "a.txt", "text": "x", "b64": "eA=="},
+                    {"path": "a.txt", "b64": "!!!"}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_inputs([bad])
+        with self.assertRaises(ValueError):
+            parse_inputs([{"path": "big.bin", "b64": "eA=="}] * 51)
+
+    def test_inputs_oversize_rejected(self):
+        from skill_registry.execute import parse_inputs
+        with self.assertRaises(ValueError):
+            parse_inputs([{"path": "big.bin", "text": "x" * 1_000_001}])
+
+    def test_artifacts_include_b64(self):
+        from skill_registry.execute import collect_artifacts
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "out.txt").write_bytes(b"hello")
+            (root / "out.pdf").write_bytes(bytes(range(256)))
+            arts = {a["path"]: a for a in collect_artifacts(root)}
+            self.assertEqual(arts["out.txt"]["contents"], "hello")
+            import base64
+            self.assertEqual(base64.b64decode(arts["out.pdf"]["contents_b64"]),
+                             bytes(range(256)))
+            self.assertIsNone(arts["out.pdf"]["contents"])
+
     def test_unknown_entrypoint(self):
         from skill_registry.execute import execute
         m = self.manifest()
@@ -442,9 +479,10 @@ class ExecuteTest(unittest.TestCase):
             self.skipTest("no python:3.12-slim")
         body = b"import sys\nprint('hello-exact:' + sys.argv[1])\n"
         m = self.manifest()
+        import hashlib
+        m["integrity"]["sha256"] = hashlib.sha256(b"live-run-v1" + body).hexdigest()
         for f in m["artifact"]["files"]:
             if f["path"] == "hello.py":
-                import hashlib
                 f["sha256"] = hashlib.sha256(body).hexdigest()
                 f["size"] = len(body)
         blobs = {"hello.py": body, "SKILL.md": b"# T"}
@@ -454,6 +492,38 @@ class ExecuteTest(unittest.TestCase):
         self.assertEqual(r["exit_code"], 0)
         self.assertIn("hello-exact:42", r["stdout"])
         self.assertEqual(r["verdict"], "sandbox-only")
+
+    def test_live_inputs_roundtrip(self):
+        import base64
+        import hashlib
+        import shutil
+        from skill_registry.execute import execute
+        if shutil.which("docker") is None:
+            self.skipTest("no docker")
+        images = subprocess.run(["docker", "images", "-q", "python:3.12-slim"],
+                                capture_output=True, text=True, timeout=60)
+        if not images.stdout.strip():
+            self.skipTest("no python:3.12-slim")
+        body = (b"from pathlib import Path\n"
+                b"data = Path('/inputs/in.txt').read_bytes()\n"
+                b"Path('/scratch/out.bin').write_bytes(data + b'!')\n"
+                b"print('staged-ok')\n")
+        m = self.manifest()
+        m["integrity"]["sha256"] = hashlib.sha256(b"live-inputs-v1" + body).hexdigest()
+        for f in m["artifact"]["files"]:
+            if f["path"] == "hello.py":
+                f["sha256"] = hashlib.sha256(body).hexdigest()
+                f["size"] = len(body)
+        blobs = {"hello.py": body, "SKILL.md": b"# T"}
+        r = execute(m, lambda p, s: blobs.get(p), "hello.py",
+                    inputs=[{"path": "in.txt", "text": "payload-42"}],
+                    approved=True, timeout_s=120)
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("staged-ok", r["stdout"])
+        arts = {a["path"]: a for a in r["artifacts"]}
+        self.assertIn("out.bin", arts)
+        self.assertEqual(base64.b64decode(arts["out.bin"]["contents_b64"]),
+                         b"payload-42!")
 
     def test_server_execute_gate(self):
         from skill_registry import server as mcp_server

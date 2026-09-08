@@ -35,6 +35,14 @@ r = execute_skill(manifest, read_bytes, "scripts/run.py", args=["--help"],
                   approved=True)  # sandbox-only verdicts need approved=True
 # r -> {status, exit_code, stdout, stderr, duration_ms, image, artifacts}
 # without approval: {"status": "needs-approval", "verdict": ..., ...}
+# agent files in, skill outputs out:
+r = execute_skill(manifest, read_bytes, "scripts/run.py",
+                  args=["merge", "/inputs/a.pdf", "/inputs/b.pdf",
+                        "--output", "/scratch/merged.pdf"],
+                  inputs=[{"path": "a.pdf", "b64": "..."},
+                          {"path": "b.pdf", "b64": "..."}],
+                  approved=True)
+# artifacts -> [{path, size, sha256, contents, contents_b64}]
 ```
 
 `read_bytes(path, sha256)` returns exact bytes (e.g. `FileStore.get_bytes`).
