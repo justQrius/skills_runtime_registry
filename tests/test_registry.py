@@ -485,6 +485,25 @@ class McpTest(unittest.TestCase):
                                                  "path": "SKILL.md"}}})
         self.assertEqual(r["error"]["code"], -32002)
 
+    def test_stdio_rejects_non_object_json_and_continues(self):
+        requests = [
+            [], None, "invalid", 7, True,
+            {"jsonrpc": "2.0", "id": 9, "method": "ping"},
+        ]
+        with tempfile.TemporaryDirectory() as data:
+            run = subprocess.run(
+                [sys.executable, str(ROOT / "python" / "skill_registry" / "server.py"),
+                 "--catalog", str(ROOT / "catalog"), "--data", data],
+                input="\n".join(json.dumps(request) for request in requests) + "\n",
+                capture_output=True, text=True, timeout=10,
+            )
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        responses = [json.loads(line) for line in run.stdout.splitlines()]
+        self.assertEqual([response["error"]["code"] for response in responses[:-1]],
+                         [-32600] * 5)
+        self.assertEqual(responses[-1]["result"], {})
+
     def test_search_limit_is_declared_and_validated(self):
         from skill_registry import server as mcp_server
 
@@ -752,6 +771,21 @@ class HardenTest(unittest.TestCase):
                 resp = json.loads(r.read())
             items = json.loads(resp["result"]["content"][0]["text"])
             self.assertEqual([m["skill_id"] for m in items], ["acme/react-review"])
+
+            bad = urllib.request.Request(f"http://127.0.0.1:{port}/mcp", data=b"[]",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(bad, timeout=5) as r:
+                invalid = json.loads(r.read())
+            self.assertEqual(invalid["error"]["code"], -32600)
+
+            ping_body = json.dumps({"jsonrpc": "2.0", "id": 2,
+                                    "method": "ping"}).encode()
+            ping = urllib.request.Request(f"http://127.0.0.1:{port}/mcp",
+                                          data=ping_body,
+                                          headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(ping, timeout=5) as r:
+                ping_response = json.loads(r.read())
+            self.assertEqual(ping_response["result"], {})
 
 
 class ExecuteTest(unittest.TestCase):

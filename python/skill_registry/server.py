@@ -412,7 +412,11 @@ class Server:
     }
 
     # ----- JSON-RPC -----
-    def handle(self, msg: dict):
+    def handle(self, msg: object):
+        if not isinstance(msg, dict):
+            return {"jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32600,
+                              "message": "invalid request: expected object"}}
         mid = msg.get("id")
         method = msg.get("method", "")
 

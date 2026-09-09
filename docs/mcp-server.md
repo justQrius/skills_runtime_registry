@@ -54,6 +54,8 @@ Cloud mode serves JSON-RPC at `POST /mcp` plus `GET /healthz`
 `catalog/`), `--data DIR` (default `~/.skill-registry/files`,
 `SKILL_REGISTRY_DATA` env or `/data/files` in Docker). HTTP request bodies are
 limited to 2MB; artifact and package responses may be larger.
+Both transports reject non-object JSON-RPC messages with `-32600` while
+remaining available for subsequent requests.
 
 ## Tools
 

@@ -4,6 +4,8 @@ All notable changes, newest first. Updated every iteration.
 
 ## Unreleased
 
+- Fixed stdio and HTTP JSON-RPC dispatch so valid JSON arrays and scalars
+  return `-32600` instead of crashing the server process or request handler.
 - Documentation synchronized with the v1.1 package, SDK, MCP tools, current
   Docker deployment, executable runtime, and delivered product scope.
 
