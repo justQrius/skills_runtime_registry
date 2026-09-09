@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import base64
 import io
 import zipfile
@@ -360,6 +361,47 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(to_manifest(d, None)["description"],
                          "Rotate and watermark PDFs.")
 
+    def test_audited_only_rejects_before_package_persistence(self):
+        from skill_registry.ingest import import_ids
+
+        detail = {
+            "id": "owner/pack/unaudited",
+            "slug": "unaudited",
+            "hash": "source-hash",
+            "files": [{"path": "SKILL.md", "contents": "# Unsafe"}],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            store = FileStore(d)
+            with mock.patch("skill_registry.ingest.fetch_page",
+                            side_effect=[detail, {"audits": []}]):
+                with self.assertRaisesRegex(PermissionError, "not audited"):
+                    import_ids([detail["id"]], "https://skills.sh", "token",
+                               files=store, audited_only=True)
+            self.assertEqual(list(Path(d).glob("*.json")), [])
+
+    def test_audited_only_validates_entire_batch_before_persistence(self):
+        from skill_registry.ingest import import_ids
+
+        accepted = {
+            "id": "owner/pack/accepted", "slug": "accepted", "hash": "one",
+            "files": [{"path": "SKILL.md", "contents": "# Accepted"}],
+        }
+        rejected = {
+            "id": "owner/pack/rejected", "slug": "rejected", "hash": "two",
+            "files": [{"path": "SKILL.md", "contents": "# Rejected"}],
+        }
+        passed_audit = {"audits": [{"provider": "Snyk", "status": "pass",
+                                     "auditedAt": "2026-09-09T00:00:00Z"}]}
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("skill_registry.ingest.fetch_page", side_effect=[
+                accepted, passed_audit, rejected, {"audits": []},
+            ]):
+                with self.assertRaises(PermissionError):
+                    import_ids([accepted["id"], rejected["id"]],
+                               "https://skills.sh", "token",
+                               files=FileStore(d), audited_only=True)
+            self.assertEqual(list(Path(d).glob("*.json")), [])
+
     def test_store_artifact(self):
         reg = seed_registry()
         art = reg.get_artifact("acme/react-review")
@@ -636,6 +678,97 @@ class McpTest(unittest.TestCase):
                 os.environ["SKILLS_SH_TOKEN"] = old
         self.assertEqual(body["status"], "unconfigured")
 
+    def test_refresh_accepts_request_scoped_token_without_persisting_it(self):
+        from skill_registry import server as mcp_server
+
+        old = os.environ.pop("SKILLS_SH_TOKEN", None)
+        try:
+            srv = mcp_server.Server(ROOT / "catalog", tempfile.mkdtemp(),
+                                    admin_key="secret")
+            srv.public = True
+            with mock.patch("skill_registry.ingest.import_ids",
+                            return_value=[]) as imported:
+                body = srv.t_refresh({
+                    "ids": ["owner/pack/skill"],
+                    "_admin_key": "secret",
+                    "_skills_sh_token": "fresh-request-token",
+                })
+            self.assertEqual(body, {"status": "ok", "imported": []})
+            self.assertEqual(imported.call_args.args[2], "fresh-request-token")
+            self.assertNotIn("fresh-request-token", json.dumps(body))
+            self.assertNotIn("SKILLS_SH_TOKEN", os.environ)
+        finally:
+            if old is not None:
+                os.environ["SKILLS_SH_TOKEN"] = old
+
+    def test_http_credentials_are_injected_only_into_refresh(self):
+        from skill_registry import server as mcp_server
+
+        refresh = {"params": {"name": "refresh", "arguments": {}}}
+        mcp_server._inject_http_credentials(
+            refresh, "admin", "Bearer request-token")
+        self.assertEqual(refresh["params"]["arguments"], {
+            "_admin_key": "admin",
+            "_skills_sh_token": "request-token",
+        })
+
+        search = {"params": {"name": "search", "arguments": {}}}
+        mcp_server._inject_http_credentials(search, "admin", "Bearer secret")
+        self.assertEqual(search["params"]["arguments"], {})
+
+
+class RefreshClientTest(unittest.TestCase):
+    def test_sends_credentials_in_headers_and_returns_tool_result(self):
+        from skill_registry.refresh_client import refresh_registry
+
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                inner = json.dumps({"status": "ok", "imported": []})
+                return json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"content": [{"type": "text", "text": inner}]},
+                }).encode()
+
+        def opener(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return Response()
+
+        result = refresh_registry(
+            "http://127.0.0.1:8125/mcp",
+            ["owner/pack/skill"],
+            token="oidc-token",
+            admin_key="admin-key",
+            opener=opener,
+        )
+
+        request = captured["request"]
+        self.assertEqual(request.get_header("Authorization"), "Bearer oidc-token")
+        self.assertEqual(request.get_header("X-admin-key"), "admin-key")
+        body = json.loads(request.data)
+        self.assertEqual(body["params"]["arguments"], {
+            "ids": ["owner/pack/skill"],
+            "official_ids": [],
+            "audited_only": True,
+        })
+        self.assertEqual(result, {"status": "ok", "imported": []})
+
+    def test_refuses_plain_http_to_non_loopback_host(self):
+        from skill_registry.refresh_client import refresh_registry
+
+        with self.assertRaisesRegex(ValueError, "HTTPS or a loopback"):
+            refresh_registry("http://registry.example/mcp", ["a/b/c"],
+                             token="token", admin_key="key")
+
 
 class HardenTest(unittest.TestCase):
     def test_frontmatter_stripped_from_context(self):
@@ -669,6 +802,27 @@ class HardenTest(unittest.TestCase):
                 os.environ.pop("SKILLS_SH_TOKEN", None)
             else:
                 os.environ["SKILLS_SH_TOKEN"] = old
+
+    def test_refresh_audited_only_fails_closed_before_registration(self):
+        from skill_registry import server as mcp_server
+
+        candidate = dict(fixture("valid-instruction.json"))
+        candidate["skill_id"] = "test/unaudited"
+        candidate["trust"] = {"official": False, "audited": False,
+                              "revoked": False}
+        srv = mcp_server.Server(ROOT / "catalog", tempfile.mkdtemp(),
+                                admin_key="secret")
+        srv.public = True
+        with mock.patch("skill_registry.ingest.import_ids",
+                        return_value=[candidate]):
+            with self.assertRaisesRegex(PermissionError, "not audited"):
+                srv.t_refresh({
+                    "ids": [candidate["skill_id"]],
+                    "audited_only": True,
+                    "_admin_key": "secret",
+                    "_skills_sh_token": "fresh-token",
+                })
+        self.assertIsNone(srv.reg.get(candidate["skill_id"]))
 
     def test_refresh_disabled_public_without_key(self):
         from skill_registry import server as mcp_server
@@ -771,6 +925,25 @@ class HardenTest(unittest.TestCase):
                 resp = json.loads(r.read())
             items = json.loads(resp["result"]["content"][0]["text"])
             self.assertEqual([m["skill_id"] for m in items], ["acme/react-review"])
+
+            refresh_body = json.dumps({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "refresh", "arguments": {"ids": ["a/b"]}},
+            }).encode()
+            refresh_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=refresh_body,
+                headers={"Authorization": "Bearer request-token",
+                         "Content-Type": "application/json",
+                         "X-Admin-Key": "secret"})
+            with mock.patch("skill_registry.ingest.import_ids",
+                            return_value=[]) as imported:
+                with urllib.request.urlopen(refresh_req, timeout=5) as r:
+                    refresh_resp = json.loads(r.read())
+            refresh_result = json.loads(
+                refresh_resp["result"]["content"][0]["text"])
+            self.assertEqual(refresh_result, {"status": "ok", "imported": []})
+            self.assertEqual(imported.call_args.args[2], "request-token")
 
             bad = urllib.request.Request(f"http://127.0.0.1:{port}/mcp", data=b"[]",
                                          headers={"Content-Type": "application/json"})
@@ -1021,7 +1194,7 @@ class ExecuteTest(unittest.TestCase):
             self.skipTest("no docker")
         body = b"import sys\nprint('hello')\nprint('boom', file=sys.stderr)\nsys.exit(7)\n"
         with tempfile.TemporaryDirectory() as d:
-            srv = mcp_server.Server(ROOT / "catalog", d)
+            srv = mcp_server.Server(ROOT / "catalog", d, admin_key="secret")
             raw = normalize({
                 "skill_id": "test/failure", "version": "1.0.0", "name": "Failure",
                 "description": "Fails for testing.", "publisher": {"id": "test"},

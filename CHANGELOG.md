@@ -4,6 +4,12 @@ All notable changes, newest first. Updated every iteration.
 
 ## Unreleased
 
+- Added request-scoped bearer credentials for admin-gated HTTP refreshes, so a
+  long-running server no longer needs to retain an expiring Vercel OIDC token.
+- Added the stdlib `skill-registry-refresh` client and Windows scheduled-task
+  automation for daily just-in-time token acquisition, audited-only curated
+  refreshes, bounded retries, durable status logs, and checkout-independent
+  deployment.
 - Documented curated-catalog semantics and the safe agent fallback for catalog
   misses: read-only upstream discovery is allowed, local installs are not, and
   agents must never solicit registry admin or Vercel OIDC credentials.

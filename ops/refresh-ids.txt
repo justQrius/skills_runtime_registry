@@ -1,0 +1,3 @@
+coreyhaines31/marketingskills/customer-research
+firecrawl/firecrawl-workflows/firecrawl-market-research
+firecrawl/firecrawl-workflows/firecrawl-deep-research

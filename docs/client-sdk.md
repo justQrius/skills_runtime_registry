@@ -80,6 +80,11 @@ Vercel-linked administrator session; an upstream `401 invalid_token` means the
 token must be renewed. Do not ask an end user to paste the token into an agent
 conversation.
 
+For HTTP deployments, use `skill-registry-refresh` under `vercel env run`. It
+sends `VERCEL_OIDC_TOKEN` as a request-scoped bearer header alongside the local
+admin key; the token is not placed in JSON-RPC arguments or persisted by the
+server.
+
 Windows hygiene: `print()` emits `\r\n` and shell `$()` strips only `\n`,
 leaving a trailing `\r` that servers reject as an invalid header value.
 Always `.strip()` the token and strip `\r` before use or export.

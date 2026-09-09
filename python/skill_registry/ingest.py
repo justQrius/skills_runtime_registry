@@ -162,6 +162,7 @@ def import_ids(
     token: str,
     official_set: set[str] | None = None,
     files: "FileStore | None" = None,
+    audited_only: bool = False,
 ) -> list[dict]:
     """Fetch detail+audit per id, map via to_manifest, add to a Registry.
 
@@ -169,15 +170,13 @@ def import_ids(
     popularity. Returns normalized manifests. When `files` is given, every
     fetched file is stored (verified bytes keyed by skill_id + path).
     """
-    from .cache import Cache
     from .files import FileStore
     from .store import Registry
 
     official_set = official_set or set()
-    cache = Cache()
     reg = Registry()
     store = files or FileStore()
-    best: dict[str, dict] = {}
+    prepared: list[tuple[dict, list[tuple[str, str | bytes]]]] = []
     for sid in ids:
         detail = fetch_page(base, f"skills/{sid}", token)
         if detail.get("isDuplicate") is True:
@@ -189,24 +188,26 @@ def import_ids(
                 audits = None
             else:
                 raise
-        cached = cache.get(detail.get("id", sid))
-        if (
-            cached is not None
-            and detail.get("hash")
-            and cached.get("artifact", {}).get("source_hash") == detail.get("hash")
-        ):
-            m = cached
-        else:
-            m = to_manifest(detail, audits, {"official": detail.get("id", sid) in official_set})
-            m = reg.add(m)
-            cache.put(m, ttl=300)
-            package_files = [
-                (f["path"], f["contents"])
-                for f in detail.get("files") or []
-                if f.get("path") and f.get("contents") is not None
-            ]
-            store.put_bundle(m["skill_id"], m["version"], package_files)
+        m = to_manifest(detail, audits, {"official": detail.get("id", sid) in official_set})
+        trust = m.get("trust", {})
+        if audited_only and (not trust.get("audited") or trust.get("revoked")):
+            raise PermissionError(
+                f"refresh rejected skill that is not audited and non-revoked: {m['skill_id']}")
+        package_files = [
+            (f["path"], f["contents"])
+            for f in detail.get("files") or []
+            if f.get("path") and f.get("contents") is not None
+        ]
+        prepared.append((m, package_files))
+
+    best: dict[str, tuple[dict, list[tuple[str, str | bytes]]]] = {}
+    for m, package_files in prepared:
         key = m["skill_id"]
-        if key not in best or m.get("popularity", 0) > best[key].get("popularity", 0):
-            best[key] = m
-    return list(best.values())
+        if (key not in best
+                or m.get("popularity", 0) > best[key][0].get("popularity", 0)):
+            best[key] = (m, package_files)
+
+    for m, package_files in best.values():
+        reg.add(m)
+        store.put_bundle(m["skill_id"], m["version"], package_files)
+    return [m for m, _ in best.values()]

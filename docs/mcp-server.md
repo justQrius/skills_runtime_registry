@@ -30,26 +30,28 @@ Or direct, no install — add to your MCP client config (Codex, Claude, Hermes):
 }
 ```
 
-Optional live refresh from skills.sh — add one env var:
+Optional live refresh from skills.sh for a trusted stdio process — add one env
+var:
 
 ```json
 { "env": { "SKILLS_SH_TOKEN": "<vercel-oidc-token>" } }
 ```
 
-Without the token every tool works against the bundled catalog; `refresh`
-replies `unconfigured` instead of failing.
+Without the token every tool works against the bundled/persisted catalog;
+`refresh` replies `unconfigured` instead of failing. For a long-running HTTP
+deployment, prefer the request-scoped token flow below instead of storing a
+short-lived token in the container.
 
 ## Deploy (cloud)
 
 ```sh
-docker build -t skill-registry:v1.1.0 .
+docker build -t skill-registry:v1.2.0 .
 docker run -d --name skill-registry --restart unless-stopped \
   -p 127.0.0.1:8125:8000 \
-  -e SKILLS_SH_TOKEN="$SKILLS_SH_TOKEN" \
   -e SKILL_REGISTRY_ADMIN_KEY="<random>" \
   -v skill-data:/data/files \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  skill-registry:v1.1.0
+  skill-registry:v1.2.0
 curl localhost:8125/healthz
 ```
 
@@ -75,14 +77,17 @@ remaining available for subsequent requests.
 | `get_files` | `skill_id, version?, paths?` | selected or all verified files in one round trip |
 | `get_package` | `skill_id, version?` | deterministic ZIP, package hash, and file inventory receipt |
 | `invoke_tool` | `skill_id, version?, input?, policy?, approved?` | schema-validated call through a configured server-side handler, or an explicit unavailable/gated result |
-| `refresh` | `ids[], official_ids?, admin_key?` | imports live from skills.sh (needs token + admin key over HTTP) |
+| `refresh` | `ids[], official_ids?, audited_only?, admin_key?` | imports live from skills.sh (needs token + admin key over HTTP) |
 | `execute` | `skill_id, version?, entrypoint, args?, inputs?, policy?, approved?, timeout_s?` | container run, separate stdout/stderr, dependencies, artifact receipt, or a gated result |
 ## Refresh auth
 
 `refresh` spends your token and writes into the server, so over HTTP it is
 gated: set `SKILL_REGISTRY_ADMIN_KEY` on the server, then call with
 `admin_key` (or `X-Admin-Key` header). Without a server-side key, HTTP
-`refresh` is refused; stdio `refresh` stays open (local = trusted).
+`refresh` is refused; stdio `refresh` stays open (local = trusted). A trusted
+HTTP refresh client may send a fresh skills.sh token as `Authorization: Bearer
+<token>`. The server uses that token only for the current refresh request and
+does not persist or return it. Use HTTPS for non-loopback deployments.
 Docker: `-e SKILL_REGISTRY_ADMIN_KEY="<random>"`, and bind loopback-only
 (`-p 127.0.0.1:8125:8000`).
 
@@ -92,11 +97,37 @@ Local-agent convention: keep the key in `~/.skill-registry/admin_key`
 already share your privileges, so this is the correct trust boundary.
 
 `SKILLS_SH_TOKEN` is a short-lived Vercel OIDC token, not a permanent API key.
-Generate or pull it only from a trusted, Vercel-linked administrator session
-and rotate it when skills.sh returns `401 invalid_token`. A `bad admin key`,
-`unconfigured`, or upstream `401` response means refresh is unavailable to the
-caller; it does not make read-only registry tools unavailable. Never request or
-paste either credential in an agent conversation.
+Generate or pull it only from a trusted, Vercel-linked administrator session.
+The included `skill-registry-refresh` client accepts `VERCEL_OIDC_TOKEN` from
+`vercel env run`, sends it in the request header, and never writes it into the
+JSON-RPC body. A `bad admin key`, `unconfigured`, or upstream `401` response
+means refresh is unavailable to the caller; it does not make read-only registry
+tools unavailable. Never request or paste either credential in an agent
+conversation.
+
+### Automated Windows refresh
+
+The repository includes a production workstation task that fetches a fresh OIDC
+token just in time, refreshes the curated IDs in `ops/refresh-ids.txt`, and lets
+Vercel discard the process environment afterward:
+
+```powershell
+.\ops\install_windows_refresh_task.ps1 `
+  -Project <vercel-project> `
+  -Scope <vercel-team-or-user>
+```
+
+The installer links a credential-free working directory under
+`%LOCALAPPDATA%\skill-registry\vercel`, deletes the link-time `.env.local`, and
+copies a self-contained runner/client/config bundle to
+`%LOCALAPPDATA%\skill-registry\automation` so the task does not depend on a Git
+checkout. It registers a daily task named `Skill Registry Catalog Refresh`,
+configures three retries at 15-minute intervals, requires audited/non-revoked
+imports, and performs an initial refresh. The task runs as the logged-in user
+because Vercel CLI login is user-scoped. Its transcript and last-success/failure
+markers live under `%LOCALAPPDATA%\skill-registry`; Task Scheduler also records
+the process result. Edit the installed `refresh-ids.txt`, then rerun the task, to
+change the curated refresh set.
 
 ## Agent client behavior
 

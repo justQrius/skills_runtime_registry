@@ -1,8 +1,8 @@
 # Skill Registry
 
 Harness/agent/transport-agnostic on-demand skill registry. Fetches skills from
-[skills.sh](https://skills.sh) once, checks them always, and briefs whichever
-agent is on duty — with receipts.
+[skills.sh](https://skills.sh) through trusted refreshes, checks them always,
+and briefs whichever agent is on duty — with receipts.
 
 - **Search / rank under policy** — relevance-first token/morphology matching
   across descriptions, instructions, paths, topics, and tags; policy-gated
@@ -40,17 +40,21 @@ skills.sh index. Empty discovery results are catalog misses, not proof that no
 upstream skill exists; see `docs/mcp-server.md` for safe read-only discovery and
 trusted refresh behavior.
 
+Production HTTP deployments can refresh without retaining an expiring token in
+Docker. The trusted `skill-registry-refresh` client sends a just-in-time Vercel
+OIDC bearer token for one admin-gated request; `ops/install_windows_refresh_task.ps1`
+installs the daily workstation automation used by this deployment.
+
 **Run it in cloud:**
 
 ```sh
-docker build -t skill-registry:v1.1.0 .
+docker build -t skill-registry:v1.2.0 .
 docker run -d --name skill-registry --restart unless-stopped \
   -p 127.0.0.1:8125:8000 \
-  -e SKILLS_SH_TOKEN="$SKILLS_SH_TOKEN" \
   -e SKILL_REGISTRY_ADMIN_KEY="<random>" \
   -v skill-data:/data/files \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  skill-registry:v1.1.0
+  skill-registry:v1.2.0
 curl localhost:8125/healthz
 ```
 

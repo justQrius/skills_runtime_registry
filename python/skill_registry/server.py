@@ -4,7 +4,8 @@ Exposes the registry to any MCP-speaking agent: search, resolve, load,
 artifact delivery, tool invocation, refresh, and exact execution.
 
 Zero-touch: serves the bundled `catalog/` with no config. Set
-SKILLS_SH_TOKEN to enable the `refresh` tool (live import from skills.sh).
+SKILLS_SH_TOKEN for trusted stdio refreshes, or use a request-scoped bearer
+token for admin-gated HTTP refreshes.
 """
 import base64
 import hashlib
@@ -29,7 +30,26 @@ from skill_registry import (  # noqa: E402
 )
 
 NAME = "skill-registry"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+
+
+def _inject_http_credentials(msg: object, admin_key: str | None,
+                             authorization: str | None) -> None:
+    """Add transport credentials to a refresh request without exposing schema args."""
+    if not isinstance(msg, dict):
+        return
+    params = msg.get("params")
+    if not isinstance(params, dict) or params.get("name") != "refresh":
+        return
+    args = params.get("arguments")
+    if not isinstance(args, dict):
+        return
+    if admin_key:
+        args.setdefault("_admin_key", admin_key)
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+        if token and len(token) <= 16_384 and not any(ord(c) < 32 for c in token):
+            args.setdefault("_skills_sh_token", token)
 
 
 def _slim(m: dict) -> dict:
@@ -272,10 +292,10 @@ class Server:
     def t_refresh(self, a: dict) -> dict:
         from skill_registry.ingest import import_ids
 
-        token = os.environ.get("SKILLS_SH_TOKEN")
+        token = a.get("_skills_sh_token") or os.environ.get("SKILLS_SH_TOKEN")
         if not token:
             return {"status": "unconfigured",
-                    "message": "Set SKILLS_SH_TOKEN to enable live refresh; serving bundled catalog."}
+                    "message": "Provide a request bearer token or set SKILLS_SH_TOKEN to enable live refresh; serving bundled catalog."}
         if self.public and not self.admin_key:
             raise PermissionError("refresh disabled over HTTP: set SKILL_REGISTRY_ADMIN_KEY")
         if self.admin_key and a.get("admin_key") != self.admin_key:
@@ -285,10 +305,21 @@ class Server:
         official = set(a.get("official_ids", []))
         try:
             ms = import_ids(ids, self.base, token,
-                            official_set=official or None, files=self.files)
+                            official_set=official or None, files=self.files,
+                            audited_only=bool(a.get("audited_only")))
         except RuntimeError as e:
             self.tel.emit("fetch.fail", ids=ids)
             raise
+        if a.get("audited_only"):
+            rejected = [m["skill_id"] for m in ms
+                        if not m.get("trust", {}).get("audited")
+                        or m.get("trust", {}).get("revoked")]
+            if rejected:
+                self.tel.emit("skill.rejected", skill_ids=rejected,
+                              reason="refresh requires audited, non-revoked skills")
+                raise PermissionError(
+                    "refresh rejected skills that are not audited and non-revoked: "
+                    + ", ".join(rejected))
         for m in ms:
             try:
                 self.reg.add(m)
@@ -399,6 +430,7 @@ class Server:
             "type": "object",
             "properties": {"ids": {"type": "array", "items": {"type": "string"}},
                             "official_ids": {"type": "array", "items": {"type": "string"}},
+                            "audited_only": {"type": "boolean"},
                             "admin_key": {"type": "string"}}}),
         "execute": ("Run a skill entrypoint in a fresh network-isolated container; non-allow verdicts need approved:true. Pass agent files as inputs[{path, text|b64}] (staged to /inputs); write outputs to /scratch (returned as artifacts with contents + contents_b64).", {
             "type": "object", "required": ["skill_id", "entrypoint"],
@@ -545,13 +577,8 @@ def _serve_http(srv: Server, host: str, port: int) -> None:
                 self._send(400, {"jsonrpc": "2.0", "id": None,
                                  "error": {"code": -32700, "message": str(e)}})
                 return
-            key = self.headers.get("X-Admin-Key")
-            if key and isinstance(msg, dict):
-                params = msg.setdefault("params", {})
-                if isinstance(params, dict):
-                    args = params.setdefault("arguments", {})
-                    if isinstance(args, dict):
-                        args.setdefault("_admin_key", key)
+            _inject_http_credentials(msg, self.headers.get("X-Admin-Key"),
+                                     self.headers.get("Authorization"))
             resp = srv.handle(msg)
             self._send(200, resp or {"jsonrpc": "2.0", "id": msg.get("id"),
                                      "result": {"accepted": True}})
