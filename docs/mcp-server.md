@@ -3,6 +3,10 @@
 One install, zero config. The server speaks MCP over stdio and serves a
 bundled catalog — no token, no REPL, no setup calls.
 
+The catalog is curated and persisted, not an exhaustive live mirror of
+skills.sh. An empty `search` or `resolve` result means no relevant skill is
+currently imported; it does not prove that no upstream skill exists.
+
 ## Install (local)
 
 Via pip (entry point `skill-registry-mcp`):
@@ -86,6 +90,24 @@ Local-agent convention: keep the key in `~/.skill-registry/admin_key`
 (generated once via `secrets.token_hex(16)`) and pass it with each
 `refresh` call. The file protects against network callers; local processes
 already share your privileges, so this is the correct trust boundary.
+
+`SKILLS_SH_TOKEN` is a short-lived Vercel OIDC token, not a permanent API key.
+Generate or pull it only from a trusted, Vercel-linked administrator session
+and rotate it when skills.sh returns `401 invalid_token`. A `bad admin key`,
+`unconfigured`, or upstream `401` response means refresh is unavailable to the
+caller; it does not make read-only registry tools unavailable. Never request or
+paste either credential in an agent conversation.
+
+## Agent client behavior
+
+Agents should use `resolve`/`search` followed by `load`. They must not bypass a
+catalog miss with `npx skills add`, an installer, or an unrequested local skill
+installation. If broader discovery is useful, `npx -y skills@latest find
+"<query>"` or skills.sh may be used read-only to identify candidate IDs for a
+later trusted import. When refresh is unavailable, continue with the best
+local/native workflow and report the fallback briefly instead of asking the
+user for registry credentials or stalling on a credentials-versus-proceed
+choice.
 
 ## Multi-file skills
 

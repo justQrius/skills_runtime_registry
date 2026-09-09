@@ -35,6 +35,11 @@ Tools: `search`, `resolve`, `list_versions`, `validate_skill`, `load`,
 (live import; needs `SKILLS_SH_TOKEN`), and `execute` (container runs;
 approval-gated).
 
+The served catalog is a curated persisted snapshot rather than a complete live
+skills.sh index. Empty discovery results are catalog misses, not proof that no
+upstream skill exists; see `docs/mcp-server.md` for safe read-only discovery and
+trusted refresh behavior.
+
 **Run it in cloud:**
 
 ```sh

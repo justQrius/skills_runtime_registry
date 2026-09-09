@@ -75,6 +75,11 @@ token = os.environ["SKILLS_SH_TOKEN"]  # caller-supplied Vercel OIDC bearer
 # export it as SKILLS_SH_TOKEN, then call import_ids(ids, base, token).
 ```
 
+Vercel OIDC tokens are short-lived. Obtain or rotate them only in a trusted,
+Vercel-linked administrator session; an upstream `401 invalid_token` means the
+token must be renewed. Do not ask an end user to paste the token into an agent
+conversation.
+
 Windows hygiene: `print()` emits `\r\n` and shell `$()` strips only `\n`,
 leaving a trailing `\r` that servers reject as an invalid header value.
 Always `.strip()` the token and strip `\r` before use or export.

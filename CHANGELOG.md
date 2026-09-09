@@ -4,6 +4,12 @@ All notable changes, newest first. Updated every iteration.
 
 ## Unreleased
 
+- Documented curated-catalog semantics and the safe agent fallback for catalog
+  misses: read-only upstream discovery is allowed, local installs are not, and
+  agents must never solicit registry admin or Vercel OIDC credentials.
+- Documented that `SKILLS_SH_TOKEN` is short-lived, how to interpret refresh
+  authentication failures, and that read-only registry operation remains
+  available when trusted refresh is not.
 - Fixed stdio and HTTP JSON-RPC dispatch so valid JSON arrays and scalars
   return `-32600` instead of crashing the server process or request handler.
 - Documentation synchronized with the v1.1 package, SDK, MCP tools, current
