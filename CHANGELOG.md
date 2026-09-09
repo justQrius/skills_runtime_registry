@@ -2,7 +2,16 @@
 
 All notable changes, newest first. Updated every iteration.
 
-## Unreleased
+## v1.3.0 (2026-09-09)
+
+- Added the `discover` MCP tool: live skills.sh search against the public
+  `/api/search` endpoint (no token required), returning ranked discovery
+  cards (`skill_id/name/source/installs`). Composes with the existing
+  trusted `refresh` flow: discover -> pick ids -> refresh -> import.
+- Added `discover.ok` / `discover.fail` telemetry events.
+- Documented the new tool in README and docs/mcp-server.md.
+
+## 1.2.0 — 2026-09-09
 
 - Added request-scoped bearer credentials for admin-gated HTTP refreshes, so a
   long-running server no longer needs to retain an expiring Vercel OIDC token.

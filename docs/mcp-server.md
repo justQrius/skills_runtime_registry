@@ -45,13 +45,13 @@ short-lived token in the container.
 ## Deploy (cloud)
 
 ```sh
-docker build -t skill-registry:v1.2.0 .
+docker build -t skill-registry:v1.3.0 .
 docker run -d --name skill-registry --restart unless-stopped \
   -p 127.0.0.1:8125:8000 \
   -e SKILL_REGISTRY_ADMIN_KEY="<random>" \
   -v skill-data:/data/files \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  skill-registry:v1.2.0
+  skill-registry:v1.3.0
 curl localhost:8125/healthz
 ```
 

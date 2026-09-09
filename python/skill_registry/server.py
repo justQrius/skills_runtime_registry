@@ -30,7 +30,7 @@ from skill_registry import (  # noqa: E402
 )
 
 NAME = "skill-registry"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 def _inject_http_credentials(msg: object, admin_key: str | None,
