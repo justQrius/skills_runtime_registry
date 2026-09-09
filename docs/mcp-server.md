@@ -77,6 +77,7 @@ remaining available for subsequent requests.
 | `get_files` | `skill_id, version?, paths?` | selected or all verified files in one round trip |
 | `get_package` | `skill_id, version?` | deterministic ZIP, package hash, and file inventory receipt |
 | `invoke_tool` | `skill_id, version?, input?, policy?, approved?` | schema-validated call through a configured server-side handler, or an explicit unavailable/gated result |
+| `discover` | `query, limit?, owner?` | live skills.sh search cards (public endpoint, no token) — pass chosen ids to `refresh` to import |
 | `refresh` | `ids[], official_ids?, audited_only?, admin_key?` | imports live from skills.sh (needs token + admin key over HTTP) |
 | `execute` | `skill_id, version?, entrypoint, args?, inputs?, policy?, approved?, timeout_s?` | container run, separate stdout/stderr, dependencies, artifact receipt, or a gated result |
 ## Refresh auth

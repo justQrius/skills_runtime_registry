@@ -30,7 +30,7 @@ and briefs whichever agent is on duty — with receipts.
   }
 }
 ```
-Tools: `search`, `resolve`, `list_versions`, `validate_skill`, `load`,
+Tools: `discover` (live skills.sh search, no token), `search`, `resolve`, `list_versions`, `validate_skill`, `load`,
 `get_artifact`, `get_file`, `get_files`, `get_package`, `invoke_tool`, `refresh`
 (live import; needs `SKILLS_SH_TOKEN`), and `execute` (container runs;
 approval-gated).

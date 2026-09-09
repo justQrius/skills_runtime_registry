@@ -289,6 +289,25 @@ class Server:
         return {"status": "ok", "skill_id": m["skill_id"], "version": m["version"],
                 "tool": tool, "output": output}
 
+    def t_discover(self, a: dict) -> dict:
+        """Live skills.sh search — discovery cards, no token needed."""
+        from skill_registry.discover import discover
+
+        limit = self._limit(a.get("limit"), default=20)
+        try:
+            result = discover(
+                self.base,
+                a.get("query", ""),
+                limit=limit,
+                owner=a.get("owner"),
+            )
+        except (RuntimeError, ValueError) as e:
+            self.tel.emit("discover.fail", query=a.get("query", ""))
+            raise
+        self.tel.emit("discover.ok", query=a.get("query", ""),
+                      count=result.get("count"))
+        return result
+
     def t_refresh(self, a: dict) -> dict:
         from skill_registry.ingest import import_ids
 
@@ -426,6 +445,12 @@ class Server:
             "properties": {"skill_id": {"type": "string"}, "version": {"type": "string"},
                             "input": {"type": "object"}, "policy": {"type": "object"},
                             "approved": {"type": "boolean"}}}),
+        "discover": ("Search the live skills.sh index (no token; catalog not required). Returns ranked discovery cards; pass chosen ids to refresh to import.", {
+            "type": "object", "required": ["query"],
+            "properties": {"query": {"type": "string"},
+                            "limit": {"type": "integer", "minimum": 1,
+                                      "maximum": 100},
+                            "owner": {"type": "string"}}}),
         "refresh": ("Import skill ids live from skills.sh (needs SKILLS_SH_TOKEN; over HTTP also needs admin_key).", {
             "type": "object",
             "properties": {"ids": {"type": "array", "items": {"type": "string"}},

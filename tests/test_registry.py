@@ -490,7 +490,7 @@ class McpTest(unittest.TestCase):
         self.assertEqual(names, ["search", "resolve", "list_versions", "validate_skill",
                                  "load", "get_artifact",
                                  "get_file", "get_files", "get_package",
-                                 "invoke_tool", "refresh", "execute"])
+                                 "invoke_tool", "discover", "refresh", "execute"])
 
         def text(resp):
             return json.loads(resp["result"]["content"][0]["text"])
