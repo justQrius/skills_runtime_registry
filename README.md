@@ -38,13 +38,14 @@ approval-gated).
 **Run it in cloud:**
 
 ```sh
-docker build -t skill-registry .
-docker run -p 127.0.0.1:8125:8000 \
+docker build -t skill-registry:v1.1.0 .
+docker run -d --name skill-registry --restart unless-stopped \
+  -p 127.0.0.1:8125:8000 \
   -e SKILLS_SH_TOKEN="$SKILLS_SH_TOKEN" \
   -e SKILL_REGISTRY_ADMIN_KEY="<random>" \
   -v skill-data:/data/files \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  skill-registry
+  skill-registry:v1.1.0
 curl localhost:8125/healthz
 ```
 
@@ -57,7 +58,7 @@ node js/test.mjs
 ```
 | Path | What |
 |---|---|
-| `python/skill_registry/` | Core library (stdlib only): manifest, search, resolve, policy, cache, telemetry, loader, files, ingest, execute |
+| `python/skill_registry/` | Core library (stdlib only): manifest/schema validation, search, resolve, policy, cache, telemetry, loading, file ingest, conformance, runtimes, and execution |
 | `python/skill_registry/server.py` | MCP server: stdio (local) + `--http` (cloud) |
 | `python/demo.py` | End-to-end verification demo |
 | `js/index.js` | JS SDK mirror (search/resolve/load/verify) |
@@ -73,5 +74,6 @@ node js/test.mjs
 - `docs/manifest-v1.md` — manifest field reference
 - `docs/client-sdk.md` — Python + JS snippets, token setup
 - `docs/publisher.md` — authoring skills, digests
+- `agent_agnostic_skill_registry_prd.md` — product rationale, delivered scope, and roadmap
 - `CHANGELOG.md` — what changed, per iteration
 - `AGENTS.md` — conventions for agents working in this repo

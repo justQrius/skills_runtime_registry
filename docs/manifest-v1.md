@@ -2,11 +2,12 @@
 
 Strict subset of `schema/manifest.schema.json`. Unknown top-level keys rejected (`unknown field: <key>`).
 
-| `skill_id` | `publisher/name` | `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+$` (multi-segment for skills.sh `source/slug`) |
+| Field | Type / example | Notes |
 |---|---|---|
+| `skill_id` | `publisher/name` | `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+$` (multi-segment for skills.sh `source/slug`) |
 | `version` | semver | `1.2.0`; skills.sh uses upstream semver when available, otherwise a content-derived `0.0.0+<hash>` |
 | `name` | string | non-empty |
-| `description` | string | non-empty; SKILL.md paragraph for imports |
+| `description` | string | non-empty; imports prefer frontmatter `description`, then the first SKILL.md paragraph |
 | `publisher` | `{id, verified?, official?}` | `id` required |
 | `topics` / `tags` | string[] | ranking signals (`tag:+2`) |
 | `pack` | string\|null | grouping |
@@ -25,7 +26,8 @@ Strict subset of `schema/manifest.schema.json`. Unknown top-level keys rejected 
 
 ## Deprecation / replacement
 
-- `deprecation.deprecated: true` demotes (`-5`) but still returns unless filtered.
+- `deprecation.deprecated: true` demotes a resolved candidate (`-5`); search
+  excludes deprecated skills unless `include_deprecated` is set.
 - `deprecation.replaced_by: "<skill_id>"` names the successor; clients should resolve the successor next.
 - Cache evicts entries whose stored `audited: true` flips to `false` on the live object (`audit-withdrawn`).
 

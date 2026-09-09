@@ -38,17 +38,22 @@ replies `unconfigured` instead of failing.
 ## Deploy (cloud)
 
 ```sh
-docker build -t skill-registry .
-docker run -p 8000:8000 \
+docker build -t skill-registry:v1.1.0 .
+docker run -d --name skill-registry --restart unless-stopped \
+  -p 127.0.0.1:8125:8000 \
   -e SKILLS_SH_TOKEN="$SKILLS_SH_TOKEN" \
+  -e SKILL_REGISTRY_ADMIN_KEY="<random>" \
   -v skill-data:/data/files \
-  skill-registry
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  skill-registry:v1.1.0
+curl localhost:8125/healthz
 ```
 
 Cloud mode serves JSON-RPC at `POST /mcp` plus `GET /healthz`
 (container HEALTHCHECK wired). Flags: `--catalog DIR` (default bundled
 `catalog/`), `--data DIR` (default `~/.skill-registry/files`,
-`SKILL_REGISTRY_DATA` env or `/data/files` in Docker).
+`SKILL_REGISTRY_DATA` env or `/data/files` in Docker). HTTP request bodies are
+limited to 2MB; artifact and package responses may be larger.
 
 ## Tools
 
@@ -59,7 +64,7 @@ Cloud mode serves JSON-RPC at `POST /mcp` plus `GET /healthz`
 | `list_versions` | `skill_id` | semantic-version-ordered versions and latest |
 | `validate_skill` | `skill_id, version?, profile?` | package conformance report (`ecosystem` or `strict`) |
 | `load` | `skill_id, version?` | instruction context, workflow definition, or tool binding availability plus entrypoints and files |
-| `get_artifact` | `skill_id, version?` | instruction, tool_ref, input/output schemas |
+| `get_artifact` | `skill_id, version?` | modes, instruction/tool/workflow payload, schemas, provenance, files, and entrypoints |
 | `get_file` | `skill_id, path, version?` | one verified file (`contents` for UTF-8 and exact `contents_b64`) |
 | `get_files` | `skill_id, version?, paths?` | selected or all verified files in one round trip |
 | `get_package` | `skill_id, version?` | deterministic ZIP, package hash, and file inventory receipt |
@@ -96,14 +101,15 @@ lives in `catalog/` (`--catalog` overrides).
 
 ## Telemetry
 
-Every tool call appends to `<data>/telemetry.jsonl`: `search.requested` →
-`candidates.returned` → `skill.selected` → `fetch.ok|fail` →
-`integrity.ok|fail` → `cache.hit|miss` → `execution.ok|fail`.
-Same event names as the library.
+Applicable tool operations append events to `<data>/telemetry.jsonl`, including
+`search.requested`, `candidates.returned`, `skill.selected`, `skill.rejected`,
+`fetch.ok|fail`, `integrity.ok|fail`, `cache.hit|miss`, and
+`execution.ok|fail`. A single call emits only the events relevant to its path.
+The event names match the library.
 
 ## Exact execution (`execute` tool)
 
-`execute {skill_id, entrypoint, args?, inputs?, policy?, approved?, timeout_s?}`
+`execute {skill_id, version?, entrypoint, args?, inputs?, policy?, approved?, timeout_s?}`
 runs the skill's pinned file tree in a fresh container and returns separate
 `stdout/stderr`, `exit_code`, `duration_ms`, image and dependency receipts,
 plus `artifacts` and `artifact_receipt`. Only paths declared in

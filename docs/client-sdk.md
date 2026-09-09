@@ -4,7 +4,6 @@
 
 ```python
 from skill_registry import Registry, search, resolve, load, unload
-import json
 
 reg = Registry()
 reg.load_dir("examples/seeds")
@@ -13,7 +12,7 @@ items = reg.all()
 hits = search(items, "react")  # [acme/react-review]
 res = resolve(items, task="approve procurement", official_only=True,
               audited_only=True, agent_class="workflow-agent")
-top = reg.get(res["candidates"][0]["skill_id"])
+top = reg.get("acme/react-review")
 
 session: dict = {}
 out = load(top, session)  # instruction -> session["context_blocks"]
@@ -59,12 +58,12 @@ required.
 ## JS
 
 ```js
-import { search, resolve, resolveDetailed, load, verify } from "./js/index.js";
+import { search, resolve, resolveDetailed, load, digest, verify } from "./js/index.js";
 const hits = search(items, "procurement");
-const r = resolve(items, { tags: ["react"], officialOnly: true, auditedOnly: true });
-const detail = resolveDetailed(items, { task: "rotate a PDF" });
-const ctx = load(hits[0]);
-verify(hits[0], hits[0].integrity.sha256); // true when pinned
+const r = resolve(items, { tags: ["procurement"], officialOnly: true, auditedOnly: true });
+const detail = resolveDetailed(items, { task: "approve procurement" });
+const binding = load(hits[0]); // tool binding for the procurement seed
+verify(hits[0], digest(hits[0])); // true
 ```
 
 ## skills.sh token (Vercel OIDC)

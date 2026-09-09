@@ -4,6 +4,9 @@ All notable changes, newest first. Updated every iteration.
 
 ## Unreleased
 
+- Documentation synchronized with the v1.1 package, SDK, MCP tools, current
+  Docker deployment, executable runtime, and delivered product scope.
+
 ## 1.1.0 — 2026-09-08
 
 - Whole-package registry: version-aware file persistence and cache keys,
@@ -38,11 +41,11 @@ All notable changes, newest first. Updated every iteration.
   ephemeral per-run layer over the cached skill image). Declared entrypoints
   run from the pinned tree. Skill writes to `/scratch/<path>`; artifacts
   now add `contents_b64` (exact bytes ≤10MB, incl. binaries) alongside
-  `contents`. Container stderr merged into `stdout` (tracebacks no longer
-  dropped); traversal check hardened cross-platform (shared helper).
+  `contents`. Container stdout and stderr are preserved separately (tracebacks
+  are no longer dropped); traversal checks are hardened cross-platform.
 - Fixed: `/scratch` was a tmpfs mount, which `docker cp` cannot see — every
   run returned `artifacts: []`. `/scratch` + `/inputs` are now plain dirs
-  baked into the image (`EXEC_RECIPE` 2→3, stale images invalidated);
+  baked into the image (`EXEC_RECIPE` 2→4, stale images invalidated);
   `--read-only` dropped for the same reason (throwaway container still:
   `--network none`, capped, removed after with its input layer).
 - Exact execution: `skill_registry.execute` (gate → materialize pinned
@@ -59,7 +62,8 @@ All notable changes, newest first. Updated every iteration.
   bearer tokens (Windows `\r` hygiene).
 - Tests at 77 (manifest/package integrity, versions, discovery, policy,
   activation, telemetry, persistence, HTTP, catalog parity, and execution).
-- Production cut: `tests/test_registry.py` (23 stdlib unittests, the gate).
+- Initial production cut: `tests/test_registry.py` began with 23 stdlib
+  unittests and remains the permanent Python gate.
 - Server moved in-package (`skill_registry.server`); `pip install .` verified
   (`skill-registry-mcp` stdio search green).
 - `README.md` quickstart + repo map; `docs/mcp-server.md` pip/Docker/HTTP.

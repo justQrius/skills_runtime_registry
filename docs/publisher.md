@@ -2,7 +2,7 @@
 
 ## `skill_id`
 
-Lowercase, one or more segments: `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+$`.
+Lowercase, two or more segments: `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+$`.
 Bad: `BAD`, `Acme/Review`. skills.sh imports use the upstream `id`
 (`source/slug`, e.g. `vercel-labs/agent-skills/vercel-react-best-practices`).
 
@@ -47,9 +47,9 @@ entrypoints. The opinionated `strict` profile also requires explicit
 
 ```python
 from skill_registry.manifest import normalize
-from skill_registry.cache import Cache
+from skill_registry import digest
 m = normalize(raw)
-m["integrity"]["sha256"] = Cache().digest(m)  # or digest(m)
+m["integrity"]["sha256"] = digest(m)
 ```
 `digest()` = sha256 over JSON (sorted keys) of every field except `integrity`.
 Recompute after any edit; `verify()` / `get_pinned()` enforce the pin.
