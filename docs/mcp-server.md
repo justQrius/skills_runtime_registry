@@ -132,11 +132,12 @@ change the curated refresh set.
 
 ## Agent client behavior
 
-Agents should use `resolve`/`search` followed by `load`. They must not bypass a
-catalog miss with `npx skills add`, an installer, or an unrequested local skill
-installation. If broader discovery is useful, `npx -y skills@latest find
-"<query>"` or skills.sh may be used read-only to identify candidate IDs for a
-later trusted import. When refresh is unavailable, continue with the best
+Agents should use `discover` for live skills.sh search, `resolve`/`search` for
+in-catalog ranking, followed by `load`. The standard acquisition chain is
+`discover -> refresh -> load`: discover returns ranked public cards (no
+token), and chosen ids go to the trusted `refresh` flow for import. Agents
+must not bypass the registry with `npx skills add`, an installer, or an
+unrequested local skill installation. When refresh is unavailable, continue with the best
 local/native workflow and report the fallback briefly instead of asking the
 user for registry credentials or stalling on a credentials-versus-proceed
 choice.

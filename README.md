@@ -35,10 +35,10 @@ Tools: `discover` (live skills.sh search, no token), `search`, `resolve`, `list_
 (live import; needs `SKILLS_SH_TOKEN`), and `execute` (container runs;
 approval-gated).
 
-The served catalog is a curated persisted snapshot rather than a complete live
-skills.sh index. Empty discovery results are catalog misses, not proof that no
-upstream skill exists; see `docs/mcp-server.md` for safe read-only discovery and
-trusted refresh behavior.
+`discover` searches the live skills.sh index directly; `search`/`resolve` rank
+the curated persisted catalog of imported skills. An empty `search` result is a
+catalog miss, not proof that no upstream skill exists — run `discover` first.
+See `docs/mcp-server.md` for the discovery chain and trusted refresh behavior.
 
 Production HTTP deployments can refresh without retaining an expiring token in
 Docker. The trusted `skill-registry-refresh` client sends a just-in-time Vercel
