@@ -1,4 +1,72 @@
 """Search: keyword + topic/pack/publisher/compatibility/trust filters."""
+import re
+
+
+_STOP_WORDS = {
+    "a", "an", "and", "as", "at", "by", "for", "from", "how", "in", "into",
+    "of", "on", "or", "the", "to", "use", "using", "with",
+}
+
+
+def _tokens(text: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9]+", str(text).lower())
+            if token not in _STOP_WORDS]
+
+
+def _variants(token: str) -> set[str]:
+    out = {token}
+    if len(token) > 4:
+        if token.endswith(("ating", "ation")):
+            out.add(token[:-5] + "ate")
+        if token.endswith("ing"):
+            out.update((token[:-3], token[:-3] + "e"))
+        if token.endswith("ed"):
+            out.update((token[:-2], token[:-2] + "e"))
+        if token.endswith("ies"):
+            out.add(token[:-3] + "y")
+        if token.endswith("al"):
+            out.update((token[:-2], token[:-2] + "e"))
+        if token.endswith("es"):
+            out.update((token[:-1], token[:-2]))
+        elif token.endswith("s"):
+            out.add(token[:-1])
+    return {item for item in out if item}
+
+
+def _document_text(m: dict) -> str:
+    artifact = m.get("artifact", {}) if isinstance(m.get("artifact", {}), dict) else {}
+    files = artifact.get("files", []) if isinstance(artifact.get("files", []), list) else []
+    file_paths = [f.get("path", "") for f in files if isinstance(f, dict)]
+    publisher = m.get("publisher", {}) if isinstance(m.get("publisher", {}), dict) else {}
+    return " ".join(str(value or "") for value in [
+        m.get("skill_id"), m.get("name"), m.get("description"), m.get("pack"),
+        publisher.get("id"), *(m.get("topics") or []), *(m.get("tags") or []),
+        artifact.get("instruction"), *file_paths,
+    ])
+
+
+def relevance(m: dict, query: str = "", tags: list[str] | None = None) -> tuple[float, list[str]]:
+    """Return lexical relevance and machine-readable reasons.
+
+    All meaningful query terms must match. Lightweight morphology keeps the
+    implementation dependency-free while covering common skill-search forms.
+    Explicit tags are capability hints and must also match.
+    """
+    doc_original = set(_tokens(_document_text(m)))
+    doc_variants = set().union(*(_variants(token) for token in doc_original)) if doc_original else set()
+    query_tokens = _tokens(query)
+    tag_tokens = [token for tag in (tags or []) for token in _tokens(tag)]
+    score = 0.0
+    reasons: list[str] = []
+    for kind, tokens in (("term", query_tokens), ("tag", tag_tokens)):
+        for token in tokens:
+            variants = _variants(token)
+            if not variants.intersection(doc_variants):
+                return (0.0, [])
+            exact = token in doc_original
+            score += 2.0 if kind == "tag" else (1.5 if exact else 1.0)
+            reasons.append(f"{kind}:{token}")
+    return (score, reasons)
 
 
 def search(
@@ -15,7 +83,7 @@ def search(
     include_revoked: bool = False,
     include_deprecated: bool = False,
 ) -> list[dict]:
-    q = query.lower().strip()
+    q = query.strip()
     out = []
     for m in items:
         t = m.get("trust", {})
@@ -41,13 +109,12 @@ def search(
         if execution_mode and execution_mode not in m.get("execution_modes", []):
             continue
         if q:
-            hay = " ".join([
-                m.get("skill_id", ""), m.get("name", ""), m.get("description", ""),
-                *m.get("topics", []), *m.get("tags", []),
-            ]).lower()
-            if q not in hay:
+            score, _ = relevance(m, q)
+            if score <= 0:
                 continue
-        out.append(m)
-    # Freshness/popularity: popularity desc, then skill_id for determinism.
-    out.sort(key=lambda m: (-m.get("popularity", 0), m["skill_id"]))
-    return out
+        else:
+            score = 0.0
+        out.append((score, m))
+    # Relevance first, then popularity and deterministic id.
+    out.sort(key=lambda row: (-row[0], -row[1].get("popularity", 0), row[1]["skill_id"]))
+    return [m for _, m in out]

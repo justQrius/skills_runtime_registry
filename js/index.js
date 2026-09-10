@@ -2,6 +2,59 @@
 // Port of python/skill_registry logic; keep weights in sync.
 import { createHash } from "node:crypto";
 
+const STOP_WORDS = new Set(["a", "an", "and", "as", "at", "by", "for", "from", "how", "in", "into", "of", "on", "or", "the", "to", "use", "using", "with"]);
+
+function tokens(text) {
+  return (String(text ?? "").toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((token) => !STOP_WORDS.has(token));
+}
+
+function variants(token) {
+  const out = new Set([token]);
+  if (token.length > 4) {
+    if (token.endsWith("ating") || token.endsWith("ation")) out.add(`${token.slice(0, -5)}ate`);
+    if (token.endsWith("ing")) {
+      out.add(token.slice(0, -3));
+      out.add(`${token.slice(0, -3)}e`);
+    }
+    if (token.endsWith("ed")) {
+      out.add(token.slice(0, -2));
+      out.add(`${token.slice(0, -2)}e`);
+    }
+    if (token.endsWith("ies")) out.add(`${token.slice(0, -3)}y`);
+    if (token.endsWith("al")) {
+      out.add(token.slice(0, -2));
+      out.add(`${token.slice(0, -2)}e`);
+    }
+    if (token.endsWith("es")) {
+      out.add(token.slice(0, -1));
+      out.add(token.slice(0, -2));
+    } else if (token.endsWith("s")) out.add(token.slice(0, -1));
+  }
+  return out;
+}
+
+function documentText(m) {
+  const artifact = m.artifact ?? {};
+  const paths = (artifact.files ?? []).map((file) => file.path ?? "");
+  return [m.skill_id, m.name, m.description, m.pack, m.publisher?.id,
+    ...(m.topics ?? []), ...(m.tags ?? []), artifact.instruction, ...paths].join(" ");
+}
+
+function relevance(m, query = "", tags = []) {
+  const original = new Set(tokens(documentText(m)));
+  const documentVariants = new Set([...original].flatMap((token) => [...variants(token)]));
+  let score = 0;
+  const rationale = [];
+  for (const [kind, wanted] of [["term", tokens(query)], ["tag", tags.flatMap(tokens)]]) {
+    for (const token of wanted) {
+      if (![...variants(token)].some((item) => documentVariants.has(item))) return [0, []];
+      score += kind === "tag" ? 2 : original.has(token) ? 1.5 : 1;
+      rationale.push(`${kind}:${token}`);
+    }
+  }
+  return [score, rationale];
+}
+
 export function search(items, query = "", opts = {}) {
   const {
     topic,
@@ -14,7 +67,7 @@ export function search(items, query = "", opts = {}) {
     includeRevoked = false,
     includeDeprecated = false,
   } = opts;
-  const q = query.toLowerCase().trim();
+  const q = query.trim();
   return items
     .filter((m) => {
       const t = m.trust ?? {};
@@ -31,11 +84,11 @@ export function search(items, query = "", opts = {}) {
         if (classes.length && !classes.includes(agentClass)) return false;
       }
       if (executionMode && !(m.execution_modes ?? []).includes(executionMode)) return false;
-      if (!q) return true;
-      const hay = [m.skill_id, m.name, m.description, ...(m.topics ?? []), ...(m.tags ?? [])].join(" ").toLowerCase();
-      return hay.includes(q);
+      return !q || relevance(m, q)[0] > 0;
     })
-    .sort((a, b) => (b.popularity ?? 0) - (a.popularity ?? 0) || a.skill_id.localeCompare(b.skill_id));
+    .sort((a, b) => relevance(b, q)[0] - relevance(a, q)[0]
+      || (b.popularity ?? 0) - (a.popularity ?? 0)
+      || a.skill_id.localeCompare(b.skill_id));
 }
 
 function decide(m, policy) {
@@ -71,6 +124,19 @@ export function resolve(
     limit = 5,
   } = {},
 ) {
+  return resolveDetailed(items, { tags, task, agentClass, allowedModes, allowlist,
+    denylist, officialOnly, auditedOnly, requireReview, limit }).candidates;
+}
+
+export function resolveDetailed(
+  items,
+  {
+    tags = [], task = "", agentClass = null, allowedModes = [], allowlist = null,
+    denylist = null, officialOnly = false, auditedOnly = false,
+    requireReview = false, limit = 5,
+  } = {},
+) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("limit must be an integer from 1 to 100");
   const policy = { allowlist, denylist, officialOnly, auditedOnly };
   const cands = items.filter((m) => {
     const sid = m.skill_id;
@@ -85,32 +151,17 @@ export function resolve(
     if (agentClass && classes.length && !classes.includes(agentClass)) return false;
     return true;
   });
-  const hints = String(task ?? "")
-    .split(/\s+/)
-    .filter((w) => w.length > 3)
-    .slice(0, 8);
-  const seen = new Set();
-  const allTags = [];
-  for (const t of [...tags, ...hints]) {
-    const tl = t.toLowerCase();
-    if (!seen.has(tl)) {
-      seen.add(tl);
-      allTags.push(t);
-    }
-  }
+  const gated = [];
   const scored = cands
     .map((m) => {
-      const [verdict] = decide(m, policy);
+      const [verdict, reason] = decide(m, policy);
       if (verdict === "deny") return null;
-      if ((verdict === "require-review" || verdict === "sandbox-only") && !requireReview) return null;
-      let s = 0;
-      const why = [];
-      const mt = [...(m.topics ?? []), ...(m.tags ?? [])].map((x) => x.toLowerCase());
-      for (const t of allTags) {
-        if (mt.includes(String(t).toLowerCase())) {
-          s += 2;
-          why.push(`tag:${t}`);
-        }
+      let [s, why] = relevance(m, task, tags);
+      if ((String(task).trim() || tags.length) && s <= 0) return null;
+      if ((verdict === "require-review" || verdict === "sandbox-only") && !requireReview) {
+        gated.push({ skill_id: m.skill_id, version: m.version, verdict, reason,
+          rationale: [...why, `policy:${verdict}`] });
+        return null;
       }
       if (agentClass) {
         const classes = m.compatibility?.agent_classes ?? [];
@@ -144,7 +195,15 @@ export function resolve(
     })
     .filter(Boolean)
     .sort((a, b) => b.s - a.s || a.m.skill_id.localeCompare(b.m.skill_id));
-  return scored.slice(0, limit).map(({ m, s, why }) => ({ skill_id: m.skill_id, version: m.version, score: Math.round(s * 100) / 100, rationale: why }));
+  const candidates = scored.slice(0, limit).map(({ m, s, why }) => ({
+    skill_id: m.skill_id, version: m.version, score: Math.round(s * 100) / 100,
+    rationale: why, permissions: m.permissions ?? {}, trust: m.trust ?? {},
+    integrity: m.integrity ?? {},
+  }));
+  const result = { candidates,
+    fallback: candidates.length ? null : gated.length ? "matching skills require review" : "fall back to native reasoning" };
+  if (gated.length) result.review_candidates = gated.slice(0, limit);
+  return result;
 }
 
 function canonical(value) {
@@ -169,7 +228,11 @@ export function verify(manifest, sha256) {
 
 export function load(m) {
   const modes = m.execution_modes ?? [];
-  if (modes.includes("instruction")) return { kind: "instruction", context: m.artifact?.instruction ?? m.description };
-  if (modes.includes("tool")) return { kind: "tool", tool: m.artifact?.tool_ref ?? m.skill_id, input_schema: m.input_schema ?? {}, output_schema: m.output_schema ?? {} };
-  return { kind: modes[0] ?? "unknown", skill_id: m.skill_id, deferred: true };
+  let out;
+  if (modes.includes("instruction")) out = { kind: "instruction", context: m.artifact?.instruction ?? m.description };
+  else if (modes.includes("tool")) out = { kind: "tool", tool: m.artifact?.tool_ref ?? m.skill_id, input_schema: m.input_schema ?? {}, output_schema: m.output_schema ?? {} };
+  else if (modes.includes("workflow")) out = { kind: "workflow", workflow: m.artifact?.workflow, deferred: false, skill_id: m.skill_id };
+  else out = { kind: modes[0] ?? "unknown", skill_id: m.skill_id, deferred: true };
+  return { ...out, execution_modes: [...modes], entrypoints: [...(m.artifact?.entrypoints ?? [])],
+    requires_approval: modes.includes("executable") };
 }

@@ -14,6 +14,14 @@ def _instruction(m: dict) -> str:
     return _strip_frontmatter(raw)
 
 
+def _with_capabilities(m: dict, out: dict) -> dict:
+    modes = list(m.get("execution_modes", []))
+    out["execution_modes"] = modes
+    out["entrypoints"] = list(m.get("artifact", {}).get("entrypoints", []))
+    out["requires_approval"] = "executable" in modes
+    return out
+
+
 def load(m: dict, session: dict | None = None) -> dict:
     modes = m.get("execution_modes", [])
     if "instruction" in modes:
@@ -22,7 +30,7 @@ def load(m: dict, session: dict | None = None) -> dict:
         if session is not None:
             session.setdefault("context_blocks", []).append(text)
             out["session_bound"] = True
-        return out
+        return _with_capabilities(m, out)
     if "tool" in modes:
         tool_name = m.get("artifact", {}).get("tool_ref") or m["skill_id"]
         out = {
@@ -37,11 +45,15 @@ def load(m: dict, session: dict | None = None) -> dict:
                 "output_schema": m.get("output_schema", {}),
             }
             out["session_bound"] = True
-        return out
+        return _with_capabilities(m, out)
     if "workflow" in modes:
-        return {"kind": "workflow", "deferred": True, "skill_id": m["skill_id"]}
-    return {"kind": "executable", "deferred": True, "skill_id": m["skill_id"],
-            "note": "executable out of MVP scope — sandbox required"}
+        return _with_capabilities(m, {"kind": "workflow", "deferred": False,
+                                      "skill_id": m["skill_id"],
+                                      "workflow": m.get("artifact", {}).get("workflow")})
+    return _with_capabilities(m, {
+        "kind": "executable", "deferred": True, "skill_id": m["skill_id"],
+        "note": "use the execute tool with a declared entrypoint",
+    })
 
 
 def unload(m: dict, session: dict) -> None:

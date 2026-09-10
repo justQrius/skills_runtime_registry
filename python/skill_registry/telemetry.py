@@ -16,6 +16,8 @@ EVENTS = (
     "execution.fail",
     "cache.hit",
     "cache.miss",
+    "discover.ok",
+    "discover.fail",
     "override",
 )
 

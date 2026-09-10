@@ -1,16 +1,18 @@
 # Skill Registry
 
 Harness/agent/transport-agnostic on-demand skill registry. Fetches skills from
-[skills.sh](https://skills.sh) once, checks them always, and briefs whichever
-agent is on duty — with receipts.
+[skills.sh](https://skills.sh) through trusted refreshes, checks them always,
+and briefs whichever agent is on duty — with receipts.
 
-- **Search / rank under policy** — keyword + trust + compatibility ranking with
-  machine-readable rationale; revoked/denylisted dropped before any agent sees
-  them.
+- **Search / rank under policy** — relevance-first token/morphology matching
+  across descriptions, instructions, paths, topics, and tags; policy-gated
+  matches remain visible as review candidates with machine-readable rationale.
 - **Multi-file skills** — manifests pin every file (`path/sha256/size`);
-  contents served hash-verified from a verified store.
+  contents are served hash-verified individually, in bulk, or as a deterministic
+  ZIP with a package receipt.
 - **Exact execution** — script-bearing skills run in fresh network-isolated
-  containers behind explicit approval; instruction skills stay text-only.
+  containers behind explicit approval; Python, shell, and JavaScript entrypoints
+  are declared explicitly and instruction skills stay text-only.
 - **Any agent** — MCP server (stdio for local, HTTP for cloud) over the same
   stdlib-only core; Python + JS SDKs for embedding.
 
@@ -28,19 +30,31 @@ agent is on duty — with receipts.
   }
 }
 ```
-Tools: `search`, `resolve`, `load`, `get_artifact`, `get_file`, `refresh`
-(live import; needs `SKILLS_SH_TOKEN`), `execute` (container runs; approval-gated).
+Tools: `discover` (live skills.sh search, no token), `search`, `resolve`, `list_versions`, `validate_skill`, `load`,
+`get_artifact`, `get_file`, `get_files`, `get_package`, `invoke_tool`, `refresh`
+(live import; needs `SKILLS_SH_TOKEN`), and `execute` (container runs;
+approval-gated).
+
+`discover` searches the live skills.sh index directly; `search`/`resolve` rank
+the curated persisted catalog of imported skills. An empty `search` result is a
+catalog miss, not proof that no upstream skill exists — run `discover` first.
+See `docs/mcp-server.md` for the discovery chain and trusted refresh behavior.
+
+Production HTTP deployments can refresh without retaining an expiring token in
+Docker. The trusted `skill-registry-refresh` client sends a just-in-time Vercel
+OIDC bearer token for one admin-gated request; `ops/install_windows_refresh_task.ps1`
+installs the daily workstation automation used by this deployment.
 
 **Run it in cloud:**
 
 ```sh
-docker build -t skill-registry .
-docker run -p 127.0.0.1:8125:8000 \
-  -e SKILLS_SH_TOKEN="$SKILLS_SH_TOKEN" \
+docker build -t skill-registry:v1.3.0 .
+docker run -d --name skill-registry --restart unless-stopped \
+  -p 127.0.0.1:8125:8000 \
   -e SKILL_REGISTRY_ADMIN_KEY="<random>" \
   -v skill-data:/data/files \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  skill-registry
+  skill-registry:v1.3.0
 curl localhost:8125/healthz
 ```
 
@@ -49,11 +63,11 @@ curl localhost:8125/healthz
 ```sh
 PYTHONPATH=python python python/demo.py   # end-to-end proof
 PYTHONPATH=python python -m unittest discover -s tests -v
-node --input-type=module -e "import('./js/index.js').then(m => console.log(typeof m.resolve))"
+node js/test.mjs
 ```
 | Path | What |
 |---|---|
-| `python/skill_registry/` | Core library (stdlib only): manifest, search, resolve, policy, cache, telemetry, loader, files, ingest, execute |
+| `python/skill_registry/` | Core library (stdlib only): manifest/schema validation, search, resolve, policy, cache, telemetry, loading, file ingest, conformance, runtimes, and execution |
 | `python/skill_registry/server.py` | MCP server: stdio (local) + `--http` (cloud) |
 | `python/demo.py` | End-to-end verification demo |
 | `js/index.js` | JS SDK mirror (search/resolve/load/verify) |
@@ -69,5 +83,6 @@ node --input-type=module -e "import('./js/index.js').then(m => console.log(typeo
 - `docs/manifest-v1.md` — manifest field reference
 - `docs/client-sdk.md` — Python + JS snippets, token setup
 - `docs/publisher.md` — authoring skills, digests
+- `agent_agnostic_skill_registry_prd.md` — product rationale, delivered scope, and roadmap
 - `CHANGELOG.md` — what changed, per iteration
 - `AGENTS.md` — conventions for agents working in this repo

@@ -46,7 +46,7 @@
     "revoked": false
   },
   "integrity": {
-    "sha256": "4023f09a9e0fb4872fb8a861b9b606af8147317ab518170b248eb1ee6257d102"
+    "sha256": "648f9952d48d0a773b4e2c37b113d7bfab47fb79fd44d93bffe5d144e7ec0cc3"
   },
   "cache": {
     "ttl_seconds": 3600,
@@ -56,7 +56,9 @@
   "artifact": {
     "instruction": "Review React components for purity, colocation, and memo boundaries.",
     "tool_ref": null,
-    "files": []
+    "workflow": null,
+    "files": [],
+    "entrypoints": []
   },
   "pack": null,
   "tool_dependencies": [],

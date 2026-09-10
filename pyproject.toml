@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skill-registry"
-version = "1.0.0"
+version = "1.3.0"
 description = "Harness/agent/transport-agnostic on-demand skill registry (skills.sh as live source)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ license = { text = "MIT" }
 
 [project.scripts]
 skill-registry-mcp = "skill_registry.server:main"
+skill-registry-refresh = "skill_registry.refresh_client:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]

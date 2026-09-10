@@ -2,18 +2,73 @@
 
 All notable changes, newest first. Updated every iteration.
 
-## Unreleased
+## v1.3.0 (2026-09-09)
+
+- Added the `discover` MCP tool: live skills.sh search against the public
+  `/api/search` endpoint (no token required), returning ranked discovery
+  cards (`skill_id/name/source/installs`). Composes with the existing
+  trusted `refresh` flow: discover -> pick ids -> refresh -> import.
+- Added `discover.ok` / `discover.fail` telemetry events.
+- Documented the new tool in README and docs/mcp-server.md.
+
+## 1.2.0 — 2026-09-09
+
+- Added request-scoped bearer credentials for admin-gated HTTP refreshes, so a
+  long-running server no longer needs to retain an expiring Vercel OIDC token.
+- Added the stdlib `skill-registry-refresh` client and Windows scheduled-task
+  automation for daily just-in-time token acquisition, audited-only curated
+  refreshes, bounded retries, durable status logs, and checkout-independent
+  deployment.
+- Documented curated-catalog semantics and the safe agent fallback for catalog
+  misses: read-only upstream discovery is allowed, local installs are not, and
+  agents must never solicit registry admin or Vercel OIDC credentials.
+- Documented that `SKILLS_SH_TOKEN` is short-lived, how to interpret refresh
+  authentication failures, and that read-only registry operation remains
+  available when trusted refresh is not.
+- Fixed stdio and HTTP JSON-RPC dispatch so valid JSON arrays and scalars
+  return `-32600` instead of crashing the server process or request handler.
+- Documentation synchronized with the v1.1 package, SDK, MCP tools, current
+  Docker deployment, executable runtime, and delivered product scope.
+
+## 1.1.0 — 2026-09-08
+
+- Whole-package registry: version-aware file persistence and cache keys,
+  semantic-version ordering, `list_versions`, bulk `get_files`, and a
+  deterministic `get_package` ZIP with archive hash and file inventory.
+- Package conformance: `validate_skill` checks `SKILL.md` frontmatter, local
+  references, file integrity/availability, and declared entrypoints; the
+  `strict` profile adds Contract/Anti-Patterns/Output Format requirements.
+- Discovery: token/morphology matching now indexes descriptions, instructions,
+  file paths, topics, tags, publisher, and pack. Resolution enforces relevance
+  before trust and returns matching policy-gated skills as `review_candidates`.
+- Activation: executable and workflow metadata is explicit; tool-mode skills
+  can be invoked through configured server-side handlers with policy and
+  dependency-free JSON Schema validation. Standalone servers report missing
+  handlers honestly instead of pretending a tool reference is callable.
+- Runtime: declared Python, shell, and JavaScript entrypoints; validated request
+  limits; separate stdout/stderr; failure/rejection telemetry; POSIX artifact
+  paths; locale-independent UTF-8 Docker logs; 25MB/200-artifact output limits
+  with truncation receipts.
+- Dependency hardening: directives, URLs, VCS/local dependencies, and source
+  distributions fail closed; dependency builds get network only when needed,
+  execution stays offline, and receipts disclose exact-pin reproducibility.
+- Import integrity: content-derived fallback versions, richer upstream metadata,
+  strict nested manifest validation, safe path/entrypoint checks, exact binary
+  retrieval, canonical registry digests distinct from upstream source hashes,
+  and atomic bundle size preflight (10MB/file, 100MB/package).
+- Python package and MCP server version advanced to 1.1.0; JS parity now has a
+  permanent executable test harness.
 
 - `execute` inputs plane: `inputs: [{path, text} | {path, b64}]` staged to
-  `/inputs/<path>` (1MB/file, 10MB total, traversal refused; baked into an
-  ephemeral per-run layer over the cached skill image). Any pinned file
-  already runs as `entrypoint`. Skill writes to `/scratch/<path>`; artifacts
-  now add `contents_b64` (exact bytes ≤100KB, incl. binaries) alongside
-  `contents`. Container stderr merged into `stdout` (tracebacks no longer
-  dropped); traversal check hardened cross-platform (shared helper).
+  `/inputs/<path>` (10MB/file, 50MB total, traversal refused; baked into an
+  ephemeral per-run layer over the cached skill image). Declared entrypoints
+  run from the pinned tree. Skill writes to `/scratch/<path>`; artifacts
+  now add `contents_b64` (exact bytes ≤10MB, incl. binaries) alongside
+  `contents`. Container stdout and stderr are preserved separately (tracebacks
+  are no longer dropped); traversal checks are hardened cross-platform.
 - Fixed: `/scratch` was a tmpfs mount, which `docker cp` cannot see — every
   run returned `artifacts: []`. `/scratch` + `/inputs` are now plain dirs
-  baked into the image (`EXEC_RECIPE` 2→3, stale images invalidated);
+  baked into the image (`EXEC_RECIPE` 2→4, stale images invalidated);
   `--read-only` dropped for the same reason (throwaway container still:
   `--network none`, capped, removed after with its input layer).
 - Exact execution: `skill_registry.execute` (gate → materialize pinned
@@ -28,8 +83,10 @@ All notable changes, newest first. Updated every iteration.
   and reload (`*.manifest.json`) — refreshes survive restarts.
 - `load` strips YAML frontmatter from agent context; `fetch_page` strips
   bearer tokens (Windows `\r` hygiene).
-- Tests at 36 (gates, telemetry, persistence, HTTP, catalog parity, execution).
-- Production cut: `tests/test_registry.py` (23 stdlib unittests, the gate).
+- Tests at 77 (manifest/package integrity, versions, discovery, policy,
+  activation, telemetry, persistence, HTTP, catalog parity, and execution).
+- Initial production cut: `tests/test_registry.py` began with 23 stdlib
+  unittests and remains the permanent Python gate.
 - Server moved in-package (`skill_registry.server`); `pip install .` verified
   (`skill-registry-mcp` stdio search green).
 - `README.md` quickstart + repo map; `docs/mcp-server.md` pip/Docker/HTTP.
